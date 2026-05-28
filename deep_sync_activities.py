@@ -36,15 +36,10 @@ def sync_activities():
         print(f"❌ Login fehlgeschlagen: {e}")
         return
 
-    try:
-        gc = gspread.authorize(Credentials.from_service_account_info(
-            json.loads(os.environ.get('GOOGLE_CREDENTIALS')), 
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        ))
-    except Exception as e:
-        print(f"❌ Google Sheets Authentifizierung fehlgeschlagen: {e}")
-        return
-
+    gc = gspread.authorize(Credentials.from_service_account_info(
+        json.loads(os.environ.get('GOOGLE_CREDENTIALS')), 
+        scopes=['https://www.googleapis.com/auth/spreadsheets']
+    ))
     sh = gc.open_by_key(os.environ.get('SHEET_ID'))
     sport_sheet = sh.worksheet("Sport")
 
@@ -58,13 +53,7 @@ def sync_activities():
     
     while should_continue:
         print(f"📦 Lade Batch ab Index {start_index}...")
-        try:
-            activities = client.get_activities(start_index, batch_size)
-        except Exception as e:
-            print(f"❌ Fehler beim Laden von Aktivitäten: {e}")
-            print(f"   Versuche in 5 Sekunden erneut...")
-            time.sleep(5)
-            continue
+        activities = client.get_activities(start_index, batch_size)
         
         if not activities: 
             print("🏁 Ende der Garmin-Historie erreicht.")
@@ -135,14 +124,10 @@ def sync_activities():
             existing_ids.append(act_id)
 
         if new_rows:
-            try:
-                new_rows.reverse() 
-                # Release 2: USER_ENTERED für Google Sheets Erkennung
-                sport_sheet.append_rows(new_rows, value_input_option='USER_ENTERED')
-                print(f"  ✅ {len(new_rows)} Aktivitäten hinzugefügt.")
-            except Exception as e:
-                print(f"❌ Fehler beim Speichern in Google Sheets: {e}")
-                return
+            new_rows.reverse() 
+            # Release 2: USER_ENTERED für Google Sheets Erkennung
+            sport_sheet.append_rows(new_rows, value_input_option='USER_ENTERED')
+            print(f"  ✅ {len(new_rows)} Aktivitäten hinzugefügt.")
         
         if should_continue:
             time.sleep(1.5) # Kurz warten, um API-Limits zu respektieren
