@@ -2,7 +2,7 @@ name: Garmin Connect Daily Sync
 
 on:
   schedule:
-    - cron: "0 4 * * *"   # Dagelijks om 08:00 UTC
+    - cron: "0 4 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -28,11 +28,10 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Daily Sync (Activities + Health)
+      - name: Run Daily Incremental Sync
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: |
-          python daily_sync.py
+        run: python daily_sync.py
