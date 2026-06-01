@@ -74,7 +74,7 @@ def fetch_health(client):
     return df
 
 # -----------------------------
-# Append new rows
+# Append new rows for Sport
 # -----------------------------
 def append_new_rows(sh, tab_name, df, key_column):
     try:
@@ -105,7 +105,31 @@ def append_new_rows(sh, tab_name, df, key_column):
     print(f"Added {len(new_rows)} new rows to {tab_name}")
 
 # -----------------------------
-# Cleanup: remove duplicates, sort, remove empty rows
+# UPSERT for Health
+# -----------------------------
+def upsert_health_row(sh, df):
+    ws = sh.worksheet("Health")
+    records = ws.get_all_records()
+
+    df["calendarDate"] = df["calendarDate"].astype(str)
+    new_row = df.iloc[0].to_dict()
+    date_value = new_row["calendarDate"]
+
+    # Zoek bestaande rij
+    for i, row in enumerate(records, start=2):  # start=2 vanwege header
+        if str(row.get("calendarDate")) == date_value:
+            # Update bestaande rij
+            values = list(new_row.values())
+            ws.update(f"A{i}", [values])
+            print(f"Updated existing health row for {date_value}")
+            return
+
+    # Bestond niet → toevoegen
+    ws.append_row(list(new_row.values()))
+    print(f"Inserted new health row for {date_value}")
+
+# -----------------------------
+# Cleanup
 # -----------------------------
 def cleanup_sheet(sh, tab_name, key_column, sort_column):
     print(f"Cleaning up sheet: {tab_name}")
@@ -121,7 +145,6 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
 
     df = df.dropna(how="all")
     df = df.drop_duplicates(subset=[key_column], keep="first")
-
     df = df.sort_values(by=sort_column)
 
     ws.clear()
@@ -138,14 +161,14 @@ def main():
     client = garmin_login()
     sh = sheets_client()
 
-    # Activities
+    # Sport (incremental append)
     df_activities = fetch_activities(client)
     append_new_rows(sh, "Sport", df_activities, key_column="activityId")
     cleanup_sheet(sh, "Sport", key_column="activityId", sort_column="startTimeLocal")
 
-    # Health
+    # Health (UPSERT)
     df_health = fetch_health(client)
-    append_new_rows(sh, "Health", df_health, key_column="calendarDate")
+    upsert_health_row(sh, df_health)
     cleanup_sheet(sh, "Health", key_column="calendarDate", sort_column="calendarDate")
 
     print("=== INCREMENTAL DAILY SYNC DONE ===")
