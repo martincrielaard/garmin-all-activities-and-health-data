@@ -1,0 +1,38 @@
+name: Garmin Connect Daily Sync
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # Dagelijks om 08:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: garmin-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Daily Sync (Activities + Health)
+        env:
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          python daily_sync.py
