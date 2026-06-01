@@ -3,7 +3,7 @@ name: Garmin Connect Daily Sync
 on:
  ## schedule:
     # Runs every day at 08:00 UTC
-   ## - cron: '0 8 * * *'
+    ## - cron: '0 4 * * *'
   workflow_dispatch:
     # Allows you to run the sync manually from the "Actions" tab
 
