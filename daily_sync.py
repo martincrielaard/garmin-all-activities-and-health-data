@@ -109,24 +109,53 @@ def append_new_rows(sh, tab_name, df, key_column):
 # -----------------------------
 def upsert_health_row(sh, df):
     ws = sh.worksheet("Health")
-    records = ws.get_all_records()
 
-    df["calendarDate"] = df["calendarDate"].astype(str)
+    # Zorg dat calendarDate een string YYYY-MM-DD is
+    df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
     new_row = df.iloc[0].to_dict()
-    date_value = new_row["calendarDate"]
+    target_date = new_row["calendarDate"]
 
-    # Zoek bestaande rij
-    for i, row in enumerate(records, start=2):  # start=2 vanwege header
-        if str(row.get("calendarDate")) == date_value:
-            # Update bestaande rij
-            values = list(new_row.values())
-            ws.update(f"A{i}", [values])
-            print(f"Updated existing health row for {date_value}")
-            return
+    # Haal alle waarden op, inclusief header
+    all_values = ws.get_all_values()
+    if not all_values:
+        # Sheet is leeg → header + eerste rij schrijven
+        header = list(new_row.keys())
+        ws.update("A1", [header, list(new_row.values())])
+        print(f"Health sheet was empty, created header and inserted {target_date}")
+        return
 
-    # Bestond niet → toevoegen
-    ws.append_row(list(new_row.values()))
-    print(f"Inserted new health row for {date_value}")
+    header = all_values[0]
+    rows = all_values[1:]
+
+    # Zoek index van calendarDate-kolom
+    try:
+        date_col_idx = header.index("calendarDate")
+    except ValueError:
+        raise Exception("Kolom 'calendarDate' niet gevonden in Health-sheet header")
+
+    # Bouw rij in dezelfde kolomvolgorde als de sheet-header
+    row_values_in_sheet_order = []
+    for col_name in header:
+        row_values_in_sheet_order.append(str(new_row.get(col_name, "")))
+
+    # Zoek bestaande rij met dezelfde datum (eerste 10 tekens vergelijken)
+    row_to_update = None
+    for i, row in enumerate(rows, start=2):  # start=2 vanwege header
+        if len(row) > date_col_idx:
+            cell_value = str(row[date_col_idx])[:10]
+            if cell_value == target_date:
+                row_to_update = i
+                break
+
+    if row_to_update:
+        # Update bestaande rij
+        ws.update(f"A{row_to_update}", [row_values_in_sheet_order])
+        print(f"Updated existing health row for {target_date}")
+    else:
+        # Append nieuwe rij
+        ws.append_row(row_values_in_sheet_order)
+        print(f"Inserted new health row for {target_date}")
+
 
 # -----------------------------
 # Cleanup
