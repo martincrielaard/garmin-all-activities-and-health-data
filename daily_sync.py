@@ -252,6 +252,9 @@ def main():
 
     # Health (UPSERT) - fetch last 3 days and upsert
     df_health = fetch_health_last_n_days(client, n=3)
+    print("DEBUG: fetched health rows:")
+    print(df_health)
+
     if not df_health.empty:
         upsert_health_rows(sh, df_health)
         cleanup_sheet(sh, "Health", key_column="calendarDate", sort_column="calendarDate")
