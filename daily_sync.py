@@ -105,57 +105,81 @@ def append_new_rows(sh, tab_name, df, key_column):
     print(f"Added {len(new_rows)} new rows to {tab_name}")
 
 # -----------------------------
-# UPSERT for Health
+# UPSERT for Health (gspread)
 # -----------------------------
-def upsert_health_row(sh, df):
-    ws = sh.worksheet("Health")
-
-    # Zorg dat calendarDate een string YYYY-MM-DD is
-    df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
-    new_row = df.iloc[0].to_dict()
-    target_date = new_row["calendarDate"]
-
-    # Haal alle waarden op, inclusief header
-    all_values = ws.get_all_values()
-    if not all_values:
-        # Sheet is leeg → header + eerste rij schrijven
-        header = list(new_row.keys())
-        ws.update("A1", [header, list(new_row.values())])
-        print(f"Health sheet was empty, created header and inserted {target_date}")
+def upsert_health_rows(sh, df):
+    """
+    Upsert multiple rows from df into sheet 'Health'.
+    df must contain a 'calendarDate' column (Date or 'yyyy-mm-dd' string).
+    """
+    ws_title = "Health"
+    try:
+        ws = sh.worksheet(ws_title)
+    except gspread.exceptions.WorksheetNotFound:
+        # create sheet with header from df
+        header = df.columns.tolist()
+        ws = sh.add_worksheet(title=ws_title, rows=2000, cols=max(20, len(header)))
+        ws.update([header])
+        # append all rows
+        df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
+        ws.append_rows(df[header].astype(str).values.tolist())
+        print(f"Created Health sheet and inserted {len(df)} rows")
         return
 
-    header = all_values[0]
-    rows = all_values[1:]
+    # Backup current sheet values (simple backup as new worksheet)
+    all_values = ws.get_all_values()
+    backup_name = f"Health_backup_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        # create backup sheet and write values
+        backup_ws = sh.add_worksheet(title=backup_name, rows=max(1, len(all_values)), cols=max(1, len(all_values[0]) if all_values else 1))
+        if all_values:
+            backup_ws.update(all_values)
+        print(f"Backup created: {backup_name}")
+    except Exception as e:
+        print(f"Warning: backup failed: {e}")
 
-    # Zoek index van calendarDate-kolom
+    # Normalize incoming df dates to 'yyyy-mm-dd'
+    df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
+
+    # Read header and existing rows
+    all_values = ws.get_all_values()
+    if not all_values:
+        # no header present, create header from df
+        header = df.columns.tolist()
+        ws.update([header])
+        existing_rows = []
+    else:
+        header = all_values[0]
+        existing_rows = all_values[1:]
+
+    # find index of calendarDate column in sheet header
     try:
         date_col_idx = header.index("calendarDate")
     except ValueError:
         raise Exception("Kolom 'calendarDate' niet gevonden in Health-sheet header")
 
-    # Bouw rij in dezelfde kolomvolgorde als de sheet-header
-    row_values_in_sheet_order = []
-    for col_name in header:
-        row_values_in_sheet_order.append(str(new_row.get(col_name, "")))
-
-    # Zoek bestaande rij met dezelfde datum (eerste 10 tekens vergelijken)
-    row_to_update = None
-    for i, row in enumerate(rows, start=2):  # start=2 vanwege header
+    # build map date -> sheet_row_number (1-based)
+    date_to_row = {}
+    for i, row in enumerate(existing_rows, start=2):  # sheet rows start at 1, header is row 1
         if len(row) > date_col_idx:
-            cell_value = str(row[date_col_idx])[:10]
-            if cell_value == target_date:
-                row_to_update = i
-                break
+            cell_val = row[date_col_idx][:10]  # first 10 chars yyyy-mm-dd
+            date_to_row[cell_val] = i
 
-    if row_to_update:
-        # Update bestaande rij
-        ws.update(f"A{row_to_update}", [row_values_in_sheet_order])
-        print(f"Updated existing health row for {target_date}")
-    else:
-        # Append nieuwe rij
-        ws.append_row(row_values_in_sheet_order)
-        print(f"Inserted new health row for {target_date}")
+    # Upsert each incoming row
+    # Ensure we write values in the same column order as the sheet header
+    for _, rec in df.iterrows():
+        rec_dict = rec.to_dict()
+        target_date = rec_dict.get("calendarDate")
+        # build row values in sheet order
+        row_values = [str(rec_dict.get(col, "")) for col in header]
 
+        if target_date in date_to_row:
+            sheet_row = date_to_row[target_date]
+            ws.update(f"A{sheet_row}", [row_values])
+            print(f"Updated existing health row for {target_date}")
+        else:
+            ws.append_row(row_values)
+            print(f"Inserted new health row for {target_date}")
 
 # -----------------------------
 # Cleanup
@@ -195,9 +219,10 @@ def main():
     append_new_rows(sh, "Sport", df_activities, key_column="activityId")
     cleanup_sheet(sh, "Sport", key_column="activityId", sort_column="startTimeLocal")
 
-    # Health (UPSERT)
+    # Health (UPSERT) - gebruik de nieuwe upsert_health_rows functie
     df_health = fetch_health(client)
-    upsert_health_row(sh, df_health)
+    # df_health is a DataFrame with one row (calendarDate etc.)
+    upsert_health_rows(sh, df_health)
     cleanup_sheet(sh, "Health", key_column="calendarDate", sort_column="calendarDate")
 
     print("=== INCREMENTAL DAILY SYNC DONE ===")
