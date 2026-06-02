@@ -135,9 +135,6 @@ def append_new_rows(sh, tab_name, df, key_column):
     ws.append_rows(new_rows.values.tolist())
     print(f"Added {len(new_rows)} new rows to {tab_name}")
 
-# -----------------------------
-# UPSERT for Health (gspread)
-# -----------------------------
 def upsert_health_rows(sh, df):
     """
     Upsert multiple rows from df into sheet 'Health'.
@@ -147,11 +144,9 @@ def upsert_health_rows(sh, df):
     try:
         ws = sh.worksheet(ws_title)
     except gspread.exceptions.WorksheetNotFound:
-        # create sheet with header from df
         header = df.columns.tolist()
         ws = sh.add_worksheet(title=ws_title, rows=2000, cols=max(20, len(header)))
         ws.update([header])
-        # append all rows
         df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
         ws.append_rows(df[header].astype(str).values.tolist())
         print(f"Created Health sheet and inserted {len(df)} rows")
@@ -161,7 +156,6 @@ def upsert_health_rows(sh, df):
     all_values = ws.get_all_values()
     backup_name = f"Health_backup_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
     try:
-        # create backup sheet and write values
         backup_ws = sh.add_worksheet(title=backup_name, rows=max(1, len(all_values)), cols=max(1, len(all_values[0]) if all_values else 1))
         if all_values:
             backup_ws.update(all_values)
@@ -175,13 +169,15 @@ def upsert_health_rows(sh, df):
     # Read header and existing rows
     all_values = ws.get_all_values()
     if not all_values:
-        # no header present, create header from df
         header = df.columns.tolist()
         ws.update([header])
         existing_rows = []
     else:
         header = all_values[0]
         existing_rows = all_values[1:]
+
+    print("DEBUG: sheet header:", header)
+    print("DEBUG: first 5 existing rows:", existing_rows[:5])
 
     # find index of calendarDate column in sheet header
     try:
@@ -191,26 +187,29 @@ def upsert_health_rows(sh, df):
 
     # build map date -> sheet_row_number (1-based)
     date_to_row = {}
-    for i, row in enumerate(existing_rows, start=2):  # sheet rows start at 1, header is row 1
+    for i, row in enumerate(existing_rows, start=2):
         if len(row) > date_col_idx:
-            cell_val = row[date_col_idx][:10]  # first 10 chars yyyy-mm-dd
+            cell_val = str(row[date_col_idx])[:10]  # first 10 chars yyyy-mm-dd
             date_to_row[cell_val] = i
+    print("DEBUG: date_to_row map (sample):", dict(list(date_to_row.items())[:10]))
 
     # Upsert each incoming row
-    # Ensure we write values in the same column order as the sheet header
     for _, rec in df.iterrows():
         rec_dict = rec.to_dict()
         target_date = rec_dict.get("calendarDate")
-        # build row values in sheet order
         row_values = [str(rec_dict.get(col, "")) for col in header]
 
+        print(f"DEBUG: processing incoming date {target_date}")
         if target_date in date_to_row:
             sheet_row = date_to_row[target_date]
+            print(f"DEBUG: match found for {target_date} at sheet row {sheet_row} — updating")
             ws.update(f"A{sheet_row}", [row_values])
             print(f"Updated existing health row for {target_date}")
         else:
+            print(f"DEBUG: no match for {target_date} — appending")
             ws.append_row(row_values)
             print(f"Inserted new health row for {target_date}")
+
 
 # -----------------------------
 # Cleanup
