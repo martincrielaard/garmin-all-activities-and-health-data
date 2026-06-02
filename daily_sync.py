@@ -61,17 +61,48 @@ def fetch_activities(client):
     return df
 
 # -----------------------------
-# Fetch health
+# Fetch health for a date (helper)
 # -----------------------------
 @retry
-def fetch_health(client):
-    print("Fetching health data...")
-    today = pd.Timestamp.now().strftime("%Y-%m-%d")
-    health = client.get_daily_summary(today)
-    df = pd.DataFrame([health])
-    df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.date
-    df["calendarDate"] = df["calendarDate"].astype(str)
+def fetch_health_for_date(client, date_str):
+    """
+    date_str: 'yyyy-mm-dd'
+    returns: dict (or None) with daily summary for that date
+    """
+    try:
+        health = client.get_daily_summary(date_str)
+        if not health:
+            return None
+        # ensure calendarDate exists and normalized
+        health['calendarDate'] = pd.to_datetime(health.get('calendarDate', date_str)).date()
+        return health
+    except Exception as e:
+        print(f"Warning: could not fetch health for {date_str}: {e}")
+        return None
+
+# -----------------------------
+# Fetch health for last N days
+# -----------------------------
+def fetch_health_last_n_days(client, n=3):
+    """
+    returns DataFrame with up to n rows, one per date (most recent first)
+    """
+    rows = []
+    today = pd.Timestamp.now().normalize()
+    for i in range(n):
+        d = (today - pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        rec = fetch_health_for_date(client, d)
+        if rec:
+            rows.append(rec)
+        else:
+            print(f"No health summary for {d}")
+    if not rows:
+        return pd.DataFrame(columns=['calendarDate'])  # empty df
+    df = pd.DataFrame(rows)
+    # normalize calendarDate to string yyyy-mm-dd
+    df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
     return df
+
 
 # -----------------------------
 # Append new rows for Sport
@@ -219,11 +250,14 @@ def main():
     append_new_rows(sh, "Sport", df_activities, key_column="activityId")
     cleanup_sheet(sh, "Sport", key_column="activityId", sort_column="startTimeLocal")
 
-    # Health (UPSERT) - gebruik de nieuwe upsert_health_rows functie
-    df_health = fetch_health(client)
-    # df_health is a DataFrame with one row (calendarDate etc.)
-    upsert_health_rows(sh, df_health)
-    cleanup_sheet(sh, "Health", key_column="calendarDate", sort_column="calendarDate")
+    # Health (UPSERT) - fetch last 3 days and upsert
+    df_health = fetch_health_last_n_days(client, n=3)
+    if not df_health.empty:
+        upsert_health_rows(sh, df_health)
+        cleanup_sheet(sh, "Health", key_column="calendarDate", sort_column="calendarDate")
+    else:
+        print("No health rows fetched for last 3 days")
+
 
     print("=== INCREMENTAL DAILY SYNC DONE ===")
 
