@@ -228,7 +228,6 @@ def upsert_health_rows(sh, df):
             norm = pd.to_datetime(row[date_col_idx]).strftime('%Y-%m-%d')
             date_to_row[norm] = i
         except Exception:
-            # fallback: raw first 10 chars if parsing fails
             try:
                 date_to_row[str(row[date_col_idx])[:10]] = i
             except Exception:
@@ -236,11 +235,85 @@ def upsert_health_rows(sh, df):
 
     print("DEBUG: date_to_row map (sample):", dict(list(date_to_row.items())[:10]))
 
-    # Upsert each incoming row
+    # --- helper: recursieve zoekfunctie en kolom‑matcher (boven de loop) ---
+    def find_in_structure(obj, target_keys):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                k_norm = str(k).strip().lower()
+                if k_norm in target_keys:
+                    return v
+            for v in obj.values():
+                found = find_in_structure(v, target_keys)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = find_in_structure(item, target_keys)
+                if found is not None:
+                    return found
+        return None
+
+    def get_value_for_column(rec, col_name):
+        if rec is None:
+            return ""
+        # direct exact match
+        if col_name in rec:
+            return rec[col_name] if rec[col_name] is not None else ""
+        # case-insensitive direct match
+        lower_map = {str(k).lower(): v for k, v in rec.items()}
+        if col_name.lower() in lower_map:
+            return lower_map[col_name.lower()] if lower_map[col_name.lower()] is not None else ""
+        # common alternative names mapping
+        alt_names = {
+            "steps": ["steps", "totalSteps", "stepCount", "dailySteps"],
+            "weight": ["weight", "bodyWeight", "weightKg"],
+            "sleephours": ["sleepHours", "sleepDuration", "sleepMinutes", "totalSleepMinutes"],
+            "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate"],
+        }
+        key_norm = ''.join(ch for ch in col_name.lower() if ch.isalnum())
+        if key_norm in alt_names:
+            targets = [n.lower() for n in alt_names[key_norm]]
+            found = find_in_structure(rec, set(targets))
+            if found is not None:
+                return found
+        # substring match
+        for k, v in rec.items():
+            if col_name.lower() in str(k).lower():
+                return v if v is not None else ""
+        # recursive search
+        found = find_in_structure(rec, {col_name.lower(), key_norm})
+        if found is not None:
+            return found
+        return ""
+
+    # Debug sample of incoming record keys
+    if len(df) > 0:
+        print("DEBUG: sample incoming health record keys (first record):")
+        sample = df.iloc[0].to_dict()
+        for k, v in sample.items():
+            print(f"  key: {k}  type: {type(v).__name__}")
+
+    # Upsert each incoming row (build row_values using helper, then update/append)
     for _, rec in df.iterrows():
         rec_dict = rec.to_dict()
         target_date = rec_dict.get("calendarDate")
-        row_values = [str(rec_dict.get(col, "")) for col in header]
+        row_values = []
+        for col in header:
+            val = get_value_for_column(rec_dict, col)
+            if isinstance(val, (dict, list)):
+                inner = find_in_structure(val, {col.lower(), ''.join(ch for ch in col.lower() if ch.isalnum())})
+                if inner is not None:
+                    val = inner
+                else:
+                    try:
+                        val = str(val)
+                    except:
+                        val = ""
+            if pd.isna(val):
+                val = ""
+            row_values.append(str(val))
 
         print(f"DEBUG: processing incoming date {target_date}")
         if target_date in date_to_row:
