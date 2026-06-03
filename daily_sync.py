@@ -11,19 +11,27 @@ RETRY_DELAY = 10
 # -----------------------------
 # Retry helper
 # -----------------------------
+
+
 def retry(func):
     def wrapper(*args, **kwargs):
-        for attempt in range(MAX_RETRIES):
+        delay = RETRY_DELAY
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                if "429" in str(e):
-                    print(f"Rate limit hit, retrying in {RETRY_DELAY}s...")
-                    time.sleep(RETRY_DELAY)
+                msg = str(e)
+                if "429" in msg or "rate limit" in msg.lower():
+                    print(f"Rate limit hit (attempt {attempt}/{MAX_RETRIES}), retrying in {delay}s... Error: {msg}")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 300)
                 else:
-                    raise e
+                    # voor andere fouten: log en herraise zodat we niet maskeren
+                    print(f"Error on attempt {attempt}: {msg}")
+                    raise
         raise Exception("Max retries reached")
     return wrapper
+
 
 # -----------------------------
 # Garmin login
@@ -63,22 +71,47 @@ def fetch_activities(client):
 # -----------------------------
 # Fetch health for a date (helper)
 # -----------------------------
+
 @retry
 def fetch_health_for_date(client, date_str):
     """
     date_str: 'yyyy-mm-dd'
     returns: dict (or None) with daily summary for that date
     """
-    try:
-        health = client.get_daily_summary(date_str)
-        if not health:
-            return None
-        # ensure calendarDate exists and normalized
-        health['calendarDate'] = pd.to_datetime(health.get('calendarDate', date_str)).date()
-        return health
-    except Exception as e:
-        print(f"Warning: could not fetch health for {date_str}: {e}")
-        return None
+    # Probeer meerdere mogelijke client‑methodes (fallback) en laat exceptions door voor retry
+    possible_methods = [
+        "get_daily_summary",
+        "get_daily_summary_by_date",
+        "get_stats",
+        "get_daily_stats",
+        "get_user_summary"
+    ]
+
+    last_exc = None
+    for m in possible_methods:
+        if hasattr(client, m):
+            try:
+                func = getattr(client, m)
+                health = func(date_str)
+                if not health:
+                    return None
+                health['calendarDate'] = pd.to_datetime(health.get('calendarDate', date_str)).date()
+                return health
+            except Exception as e:
+                # bewaar laatste exception en probeer volgende fallback
+                last_exc = e
+                # als het een 429 of netwerkfout is, laat het omhoog gaan zodat retry wrapper het oppakt
+                if "429" in str(e) or "rate limit" in str(e).lower():
+                    raise
+                # anders probeer volgende fallback
+                continue
+
+    # Als geen methode werkte: raise de laatste exception zodat retry kan optreden,
+    # of return None als er geen exception was maar geen data.
+    if last_exc:
+        raise last_exc
+    return None
+
 
 # -----------------------------
 # Fetch health for last N days
@@ -185,12 +218,19 @@ def upsert_health_rows(sh, df):
     except ValueError:
         raise Exception("Kolom 'calendarDate' niet gevonden in Health-sheet header")
 
-    # build map date -> sheet_row_number (1-based)
+    # build map date -> sheet_row_number (1-based) with robust normalization
     date_to_row = {}
     for i, row in enumerate(existing_rows, start=2):
-        if len(row) > date_col_idx:
-            cell_val = str(row[date_col_idx])[:10]  # first 10 chars yyyy-mm-dd
-            date_to_row[cell_val] = i
+    try:
+        norm = pd.to_datetime(row[date_col_idx]).strftime('%Y-%m-%d')
+        date_to_row[norm] = i
+    except Exception:
+        # fallback: raw first 10 chars if parsing fails
+        try:
+            date_to_row[str(row[date_col_idx])[:10]] = i
+        except Exception:
+            continue
+
     print("DEBUG: date_to_row map (sample):", dict(list(date_to_row.items())[:10]))
 
     # Upsert each incoming row
