@@ -169,19 +169,29 @@ def append_new_rows(sh, tab_name, df, key_column):
 # helper used by append_new_rows
 def format_distance_series(s):
     try:
-        s = pd.to_numeric(s, errors='coerce')
-        if s.isna().all():
-            return s.astype(str)
-        if s.max() > 800:
-            s = s / 1000.0
-        # geen int‑specialcase: altijd 2 decimalen
-        s = s.round(2)
-        s = s.apply(lambda x: "" if pd.isna(x) else f"{x:.2f}")
-        s = s.str.replace('.', ',', regex=False)
-        return s
+        # bewaar originele strings waar conversie faalt
+        numeric = pd.to_numeric(s, errors='coerce')
+        # heuristiek meters->km
+        if numeric.notna().any() and numeric.max() > 100:
+            numeric = numeric / 1000.0
+        # format: behoud zoveel decimalen als aanwezig (strip trailing zeros optioneel)
+        def fmt_val(x):
+            if pd.isna(x):
+                return ""
+            # convert to string with full precision, then normalize decimal separator
+            txt = repr(float(x))  # of use str(x)
+            # remove scientific notation if any
+            if 'e' in txt or 'E' in txt:
+                txt = f"{float(x):f}"
+            # strip trailing zeros and optional trailing dot
+            if '.' in txt:
+                txt = txt.rstrip('0').rstrip('.')
+            return txt.replace('.', ',')
+        return numeric.apply(fmt_val)
     except Exception as e:
         print("Warning formatting distance:", e)
         return s.astype(str)
+
 
 # -----------------------------
 # Helpers (module level)
