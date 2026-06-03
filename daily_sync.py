@@ -172,19 +172,11 @@ def format_distance_series(s):
         s = pd.to_numeric(s, errors='coerce')
         if s.isna().all():
             return s.astype(str)
-        # heuristiek: als max > 100 -> waarden in meters, zet om naar km
-        if s.max() > 100:
+        if s.max() > 800:
             s = s / 1000.0
-        # rond af op 2 decimalen, maar verwijder .00 als integer
+        # geen int‑specialcase: altijd 2 decimalen
         s = s.round(2)
-        def fmt(x):
-            if pd.isna(x):
-                return ""
-            if float(x).is_integer():
-                return str(int(x))
-            return f"{x:.2f}"
-        s = s.apply(fmt)
-        # vervang punt door komma voor NL locale
+        s = s.apply(lambda x: "" if pd.isna(x) else f"{x:.2f}")
         s = s.str.replace('.', ',', regex=False)
         return s
     except Exception as e:
