@@ -220,16 +220,16 @@ def upsert_health_rows(sh, df):
 
     # build map date -> sheet_row_number (1-based) with robust normalization
     date_to_row = {}
-    for i, row in enumerate(existing_rows, start=2):
-    try:
-        norm = pd.to_datetime(row[date_col_idx]).strftime('%Y-%m-%d')
-        date_to_row[norm] = i
-    except Exception:
-        # fallback: raw first 10 chars if parsing fails
+        for i, row in enumerate(existing_rows, start=2):
         try:
-            date_to_row[str(row[date_col_idx])[:10]] = i
+            norm = pd.to_datetime(row[date_col_idx]).strftime('%Y-%m-%d')
+            date_to_row[norm] = i
         except Exception:
-            continue
+            # fallback: raw first 10 chars if parsing fails
+            try:
+                date_to_row[str(row[date_col_idx])[:10]] = i
+            except Exception:
+                continue
 
     print("DEBUG: date_to_row map (sample):", dict(list(date_to_row.items())[:10]))
 
