@@ -3,6 +3,7 @@ import time
 import pandas as pd
 from garminconnect import Garmin
 import gspread
+import re 
 from google.oauth2.service_account import Credentials
 
 MAX_RETRIES = 5
@@ -169,6 +170,74 @@ def append_new_rows(sh, tab_name, df, key_column):
     print(f"Added {len(new_rows)} new rows to {tab_name}")
 
 # -----------------------------
+# Helpers (module level) 
+# -----------------------------
+def find_in_structure(obj, target_keys):
+    """
+    Recursively search dicts/lists for the first value whose key matches any of target_keys.
+    Returns the value or None.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            k_norm = str(k).strip().lower()
+            if k_norm in target_keys:
+                return v
+        # not direct match: recurse
+        for v in obj.values():
+            found = find_in_structure(v, target_keys)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_in_structure(item, target_keys)
+            if found is not None:
+                return found
+    return None
+
+def get_value_for_column(rec, col_name):
+    """
+    Try multiple strategies to extract a sensible value for sheet column col_name from rec (a dict).
+    """
+    if rec is None:
+        return ""
+    # direct exact match
+    if col_name in rec:
+        return rec[col_name] if rec[col_name] is not None else ""
+    # case-insensitive direct match
+    lower_map = {str(k).lower(): v for k, v in rec.items()}
+    if col_name.lower() in lower_map:
+        return lower_map[col_name.lower()] if lower_map[col_name.lower()] is not None else ""
+
+    # combined alternative names mapping
+    alt_names = {
+        "steps": ["steps", "totalSteps", "stepCount", "dailySteps", "summarySteps"],
+        "weight": ["weight", "bodyWeight", "weightKg", "weight_kg", "weightInKg"],
+        "sleephours": ["sleepHours", "sleepDuration", "sleepMinutes", "totalSleepMinutes", "sleep"],
+        "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate"],
+    }
+
+    key_norm = ''.join(ch for ch in col_name.lower() if ch.isalnum())
+    if key_norm in alt_names:
+        targets = [n.lower() for n in alt_names[key_norm]]
+        found = find_in_structure(rec, set(targets))
+        if found is not None:
+            return found
+
+    # substring match: zoek keys die de kolomnaam bevatten
+    for k, v in rec.items():
+        if col_name.lower() in str(k).lower():
+            return v if v is not None else ""
+
+    # recursive search
+    found = find_in_structure(rec, {col_name.lower(), key_norm})
+    if found is not None:
+        return found
+
+    return ""
+
+# -----------------------------
 # UPSERT for Health (gspread) with robust date matching
 # -----------------------------
 def upsert_health_rows(sh, df):
@@ -255,38 +324,46 @@ def upsert_health_rows(sh, df):
                     return found
         return None
 
-    def get_value_for_column(rec, col_name):
-        if rec is None:
-            return ""
-        # direct exact match
-        if col_name in rec:
-            return rec[col_name] if rec[col_name] is not None else ""
-        # case-insensitive direct match
-        lower_map = {str(k).lower(): v for k, v in rec.items()}
-        if col_name.lower() in lower_map:
-            return lower_map[col_name.lower()] if lower_map[col_name.lower()] is not None else ""
-        # common alternative names mapping
-        alt_names = {
-            "steps": ["steps", "totalSteps", "stepCount", "dailySteps"],
-            "weight": ["weight", "bodyWeight", "weightKg"],
-            "sleephours": ["sleepHours", "sleepDuration", "sleepMinutes", "totalSleepMinutes"],
-            "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate"],
-        }
-        key_norm = ''.join(ch for ch in col_name.lower() if ch.isalnum())
-        if key_norm in alt_names:
-            targets = [n.lower() for n in alt_names[key_norm]]
-            found = find_in_structure(rec, set(targets))
-            if found is not None:
-                return found
-        # substring match
-        for k, v in rec.items():
-            if col_name.lower() in str(k).lower():
-                return v if v is not None else ""
-        # recursive search
-        found = find_in_structure(rec, {col_name.lower(), key_norm})
+
+
+def get_value_for_column(rec, col_name):
+    if rec is None:
+        return ""
+    # direct exact match
+    if col_name in rec:
+        return rec[col_name] if rec[col_name] is not None else ""
+    # case-insensitive direct match
+    lower_map = {str(k).lower(): v for k, v in rec.items()}
+    if col_name.lower() in lower_map:
+        return lower_map[col_name.lower()] if lower_map[col_name.lower()] is not None else ""
+
+    # gecombineerde alternative names mapping
+    alt_names = {
+        "steps": ["steps", "totalSteps", "stepCount", "dailySteps", "summarySteps"],
+        "weight": ["weight", "bodyWeight", "weightKg", "weight_kg", "weightInKg"],
+        "sleephours": ["sleepHours", "sleepDuration", "sleepMinutes", "totalSleepMinutes", "sleep"],
+        "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate"],
+    }
+
+    key_norm = ''.join(ch for ch in col_name.lower() if ch.isalnum())
+    if key_norm in alt_names:
+        targets = [n.lower() for n in alt_names[key_norm]]
+        found = find_in_structure(rec, set(targets))
         if found is not None:
             return found
-        return ""
+
+    # substring match: zoek keys die de kolomnaam bevatten
+    for k, v in rec.items():
+        if col_name.lower() in str(k).lower():
+            return v if v is not None else ""
+
+    # recursieve zoekpoging
+    found = find_in_structure(rec, {col_name.lower(), key_norm})
+    if found is not None:
+        return found
+
+    return ""
+
 
     # Debug sample of incoming record keys
     if len(df) > 0:
@@ -314,6 +391,68 @@ def upsert_health_rows(sh, df):
             if pd.isna(val):
                 val = ""
             row_values.append(str(val))
+
+
+        # na row_values opgebouwd is, maar vóór schrijven
+        # zoek index van sleepHours in header (als aanwezig) en converteer minuten->uren
+        try:
+            sleep_idx = header.index("sleepHours")
+        except ValueError:
+            sleep_idx = None
+
+        if sleep_idx is not None:
+            raw = row_values[sleep_idx]
+            # probeer numerieke waarde te vinden (kan string zijn)
+            try:
+                val = float(raw)
+                # als Garmin levert in minuten (bijv. > 10), converteer naar uren
+                if val > 10:  # heuristiek: >10 betekent minuten
+                    val = round(val / 60.0, 2)
+                row_values[sleep_idx] = str(val)
+            except Exception:
+                # probeer recursief zoeken in rec_dict naar sleep in minuten
+                found = find_in_structure(rec_dict, {"sleepminutes", "sleepduration", "totalsleepminutes", "sleep"})
+                if found is not None:
+                    try:
+                        minutes = float(found)
+                        hours = round(minutes / 60.0, 2)
+                        row_values[sleep_idx] = str(hours)
+                    except:
+                        pass
+
+        # zoek index van weight in header en probeer verschillende vormen te parsen
+        try:
+            weight_idx = header.index("weight")
+        except ValueError:
+            weight_idx = None
+
+        if weight_idx is not None:
+            raw = row_values[weight_idx]
+            # direct numeriek?
+            try:
+                w = float(raw)
+                row_values[weight_idx] = str(w)
+            except:
+                # probeer alternatieve keys in rec_dict
+                found = find_in_structure(rec_dict, {"weight", "bodyweight", "weightkg", "weight_kg"})
+                if found is not None:
+                    # found kan '70' of '70 kg' of {'value':70}
+                    if isinstance(found, dict):
+                        # probeer veelvoorkomende velden
+                        for k in ("value", "weight", "kg"):
+                            if k in found:
+                                try:
+                                    row_values[weight_idx] = str(float(found[k]))
+                                    break
+                                except:
+                                    continue
+                    else:
+                        s = str(found)
+                        # strip non-numeric
+                        import re
+                        m = re.search(r"[\d\.]+", s)
+                        if m:
+                            row_values[weight_idx] = m.group(0)
 
         print(f"DEBUG: processing incoming date {target_date}")
         if target_date in date_to_row:
