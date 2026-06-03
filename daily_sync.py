@@ -9,10 +9,8 @@ MAX_RETRIES = 5
 RETRY_DELAY = 10
 
 # -----------------------------
-# Retry helper
+# Retry helper (exponential backoff)
 # -----------------------------
-
-
 def retry(func):
     def wrapper(*args, **kwargs):
         delay = RETRY_DELAY
@@ -26,7 +24,6 @@ def retry(func):
                     time.sleep(delay)
                     delay = min(delay * 2, 300)
                 else:
-                    # voor andere fouten: log en herraise zodat we niet maskeren
                     print(f"Error on attempt {attempt}: {msg}")
                     raise
         raise Exception("Max retries reached")
@@ -64,14 +61,14 @@ def fetch_activities(client):
     print("Fetching latest activities...")
     activities = client.get_activities(0, 50)
     df = pd.DataFrame(activities)
+    # parse startTimeLocal robustly; if parsing warning occurs it's fine
     df["startTimeLocal"] = pd.to_datetime(df["startTimeLocal"]).dt.date
     df["activityId"] = df["activityId"].astype(str)
     return df
 
 # -----------------------------
-# Fetch health for a date (helper)
+# Fetch health for a date (helper) with fallbacks
 # -----------------------------
-
 @retry
 def fetch_health_for_date(client, date_str):
     """
@@ -95,10 +92,10 @@ def fetch_health_for_date(client, date_str):
                 health = func(date_str)
                 if not health:
                     return None
+                # ensure calendarDate exists and normalized
                 health['calendarDate'] = pd.to_datetime(health.get('calendarDate', date_str)).date()
                 return health
             except Exception as e:
-                # bewaar laatste exception en probeer volgende fallback
                 last_exc = e
                 # als het een 429 of netwerkfout is, laat het omhoog gaan zodat retry wrapper het oppakt
                 if "429" in str(e) or "rate limit" in str(e).lower():
@@ -112,11 +109,10 @@ def fetch_health_for_date(client, date_str):
         raise last_exc
     return None
 
-
 # -----------------------------
 # Fetch health for last N days
 # -----------------------------
-def fetch_health_last_n_days(client, n=3):
+def fetch_health_last_n_days(client, n=7):
     """
     returns DataFrame with up to n rows, one per date (most recent first)
     """
@@ -124,7 +120,11 @@ def fetch_health_last_n_days(client, n=3):
     today = pd.Timestamp.now().normalize()
     for i in range(n):
         d = (today - pd.Timedelta(days=i)).strftime("%Y-%m-%d")
-        rec = fetch_health_for_date(client, d)
+        try:
+            rec = fetch_health_for_date(client, d)
+        except Exception as e:
+            print(f"Warning: could not fetch health for {d}: {e}")
+            rec = None
         if rec:
             rows.append(rec)
         else:
@@ -168,6 +168,9 @@ def append_new_rows(sh, tab_name, df, key_column):
     ws.append_rows(new_rows.values.tolist())
     print(f"Added {len(new_rows)} new rows to {tab_name}")
 
+# -----------------------------
+# UPSERT for Health (gspread) with robust date matching
+# -----------------------------
 def upsert_health_rows(sh, df):
     """
     Upsert multiple rows from df into sheet 'Health'.
@@ -243,7 +246,8 @@ def upsert_health_rows(sh, df):
         if target_date in date_to_row:
             sheet_row = date_to_row[target_date]
             print(f"DEBUG: match found for {target_date} at sheet row {sheet_row} — updating")
-            ws.update(f"A{sheet_row}", [row_values])
+            range_name = f"A{sheet_row}"
+            ws.update(range_name, [row_values])
             print(f"Updated existing health row for {target_date}")
         else:
             print(f"DEBUG: no match for {target_date} — appending")
@@ -252,28 +256,68 @@ def upsert_health_rows(sh, df):
 
 
 # -----------------------------
-# Cleanup
+# Cleanup (robust header handling)
 # -----------------------------
 def cleanup_sheet(sh, tab_name, key_column, sort_column):
     print(f"Cleaning up sheet: {tab_name}")
 
     ws = sh.worksheet(tab_name)
-    records = ws.get_all_records()
-
-    if not records:
+    # Read all values raw
+    all_values = ws.get_all_values()
+    if not all_values or len(all_values) == 0:
         print("Nothing to clean")
         return
 
-    df = pd.DataFrame(records)
+    header = all_values[0]
+    rows = all_values[1:]
 
+    # Normalize empty header cells to unique names: '' -> col_1, col_2, ...
+    normalized_header = []
+    seen = {}
+    for i, h in enumerate(header):
+        name = str(h).strip()
+        if name == "":
+            name = f"col_{i+1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 1
+        normalized_header.append(name)
+
+    # Ensure each row has same number of columns as header
+    max_cols = len(normalized_header)
+    normalized_rows = []
+    for r in rows:
+        row = list(r) + [""] * (max_cols - len(r))
+        normalized_rows.append(row[:max_cols])
+
+    df = pd.DataFrame(normalized_rows, columns=normalized_header)
+
+    # drop fully empty rows
     df = df.dropna(how="all")
-    df = df.drop_duplicates(subset=[key_column], keep="first")
-    df = df.sort_values(by=sort_column)
 
+    # dedupe on key_column if present
+    if key_column not in df.columns:
+        print(f"Warning: key_column '{key_column}' not found in normalized header; skipping dedupe")
+    else:
+        df = df.drop_duplicates(subset=[key_column], keep="first")
+
+    # sort if possible
+    if sort_column in df.columns:
+        try:
+            df = df.sort_values(by=sort_column)
+        except Exception:
+            df = df.sort_values(by=sort_column, key=lambda s: s.astype(str))
+    else:
+        print(f"Warning: sort_column '{sort_column}' not found; skipping sort")
+
+    # write back
     ws.clear()
-    ws.update([df.columns.values.tolist()] + df.values.tolist())
-
+    values = [df.columns.tolist()] + df.values.tolist()
+    ws.update(values)
     print(f"Cleanup done for {tab_name}: {len(df)} rows remain")
+
 
 # -----------------------------
 # MAIN
@@ -289,8 +333,8 @@ def main():
     append_new_rows(sh, "Sport", df_activities, key_column="activityId")
     cleanup_sheet(sh, "Sport", key_column="activityId", sort_column="startTimeLocal")
 
-    # Health (UPSERT) - fetch last 3 days and upsert
-    df_health = fetch_health_last_n_days(client, n=3)
+    # Health (UPSERT) - fetch last 7 days and upsert
+    df_health = fetch_health_last_n_days(client, n=7)
     print("DEBUG: fetched health rows:")
     print(df_health)
 
@@ -298,8 +342,7 @@ def main():
         upsert_health_rows(sh, df_health)
         cleanup_sheet(sh, "Health", key_column="calendarDate", sort_column="calendarDate")
     else:
-        print("No health rows fetched for last 3 days")
-
+        print("No health rows fetched for last 7 days")
 
     print("=== INCREMENTAL DAILY SYNC DONE ===")
 
