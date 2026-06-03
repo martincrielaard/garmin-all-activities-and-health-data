@@ -257,17 +257,6 @@ def upsert_health_rows(sh, df):
         print(f"Created Health sheet and inserted {len(df)} rows")
         return
 
-    # Backup current sheet values (simple backup as new worksheet)
-    all_values = ws.get_all_values()
-    backup_name = f"Health_backup_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
-    try:
-        backup_ws = sh.add_worksheet(title=backup_name, rows=max(1, len(all_values)), cols=max(1, len(all_values[0]) if all_values else 1))
-        if all_values:
-            backup_ws.update(all_values)
-        print(f"Backup created: {backup_name}")
-    except Exception as e:
-        print(f"Warning: backup failed: {e}")
-
     # Normalize incoming df dates to 'yyyy-mm-dd'
     df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
 
@@ -304,67 +293,7 @@ def upsert_health_rows(sh, df):
 
     print("DEBUG: date_to_row map (sample):", dict(list(date_to_row.items())[:10]))
 
-    # --- helper: recursieve zoekfunctie en kolom‑matcher (boven de loop) ---
-    def find_in_structure(obj, target_keys):
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                k_norm = str(k).strip().lower()
-                if k_norm in target_keys:
-                    return v
-            for v in obj.values():
-                found = find_in_structure(v, target_keys)
-                if found is not None:
-                    return found
-        elif isinstance(obj, list):
-            for item in obj:
-                found = find_in_structure(item, target_keys)
-                if found is not None:
-                    return found
-        return None
-
-
-
-def get_value_for_column(rec, col_name):
-    if rec is None:
-        return ""
-    # direct exact match
-    if col_name in rec:
-        return rec[col_name] if rec[col_name] is not None else ""
-    # case-insensitive direct match
-    lower_map = {str(k).lower(): v for k, v in rec.items()}
-    if col_name.lower() in lower_map:
-        return lower_map[col_name.lower()] if lower_map[col_name.lower()] is not None else ""
-
-    # gecombineerde alternative names mapping
-    alt_names = {
-        "steps": ["steps", "totalSteps", "stepCount", "dailySteps", "summarySteps"],
-        "weight": ["weight", "bodyWeight", "weightKg", "weight_kg", "weightInKg"],
-        "sleephours": ["sleepHours", "sleepDuration", "sleepMinutes", "totalSleepMinutes", "sleep"],
-        "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate"],
-    }
-
-    key_norm = ''.join(ch for ch in col_name.lower() if ch.isalnum())
-    if key_norm in alt_names:
-        targets = [n.lower() for n in alt_names[key_norm]]
-        found = find_in_structure(rec, set(targets))
-        if found is not None:
-            return found
-
-    # substring match: zoek keys die de kolomnaam bevatten
-    for k, v in rec.items():
-        if col_name.lower() in str(k).lower():
-            return v if v is not None else ""
-
-    # recursieve zoekpoging
-    found = find_in_structure(rec, {col_name.lower(), key_norm})
-    if found is not None:
-        return found
-
-    return ""
-
-
+    # Upsert helpers (module-level helpers assumed available: find_in_structure, get_value_for_column)
     # Debug sample of incoming record keys
     if len(df) > 0:
         print("DEBUG: sample incoming health record keys (first record):")
@@ -392,9 +321,7 @@ def get_value_for_column(rec, col_name):
                 val = ""
             row_values.append(str(val))
 
-
-        # na row_values opgebouwd is, maar vóór schrijven
-        # zoek index van sleepHours in header (als aanwezig) en converteer minuten->uren
+        # post-processing: sleepMinutes -> sleepHours conversion (heuristic)
         try:
             sleep_idx = header.index("sleepHours")
         except ValueError:
@@ -402,15 +329,12 @@ def get_value_for_column(rec, col_name):
 
         if sleep_idx is not None:
             raw = row_values[sleep_idx]
-            # probeer numerieke waarde te vinden (kan string zijn)
             try:
-                val = float(raw)
-                # als Garmin levert in minuten (bijv. > 10), converteer naar uren
-                if val > 10:  # heuristiek: >10 betekent minuten
-                    val = round(val / 60.0, 2)
-                row_values[sleep_idx] = str(val)
+                v = float(raw)
+                if v > 10:
+                    v = round(v / 60.0, 2)
+                row_values[sleep_idx] = str(v)
             except Exception:
-                # probeer recursief zoeken in rec_dict naar sleep in minuten
                 found = find_in_structure(rec_dict, {"sleepminutes", "sleepduration", "totalsleepminutes", "sleep"})
                 if found is not None:
                     try:
@@ -420,7 +344,7 @@ def get_value_for_column(rec, col_name):
                     except:
                         pass
 
-        # zoek index van weight in header en probeer verschillende vormen te parsen
+        # post-processing: weight parsing
         try:
             weight_idx = header.index("weight")
         except ValueError:
@@ -428,17 +352,13 @@ def get_value_for_column(rec, col_name):
 
         if weight_idx is not None:
             raw = row_values[weight_idx]
-            # direct numeriek?
             try:
                 w = float(raw)
                 row_values[weight_idx] = str(w)
             except:
-                # probeer alternatieve keys in rec_dict
                 found = find_in_structure(rec_dict, {"weight", "bodyweight", "weightkg", "weight_kg"})
                 if found is not None:
-                    # found kan '70' of '70 kg' of {'value':70}
                     if isinstance(found, dict):
-                        # probeer veelvoorkomende velden
                         for k in ("value", "weight", "kg"):
                             if k in found:
                                 try:
@@ -448,8 +368,6 @@ def get_value_for_column(rec, col_name):
                                     continue
                     else:
                         s = str(found)
-                        # strip non-numeric
-                        import re
                         m = re.search(r"[\d\.]+", s)
                         if m:
                             row_values[weight_idx] = m.group(0)
@@ -465,6 +383,7 @@ def get_value_for_column(rec, col_name):
             print(f"DEBUG: no match for {target_date} — appending")
             ws.append_row(row_values)
             print(f"Inserted new health row for {target_date}")
+
 
 
 # -----------------------------
