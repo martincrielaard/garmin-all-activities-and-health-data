@@ -3,7 +3,7 @@ import time
 import pandas as pd
 from garminconnect import Garmin
 import gspread
-import re 
+import re
 from google.oauth2.service_account import Credentials
 
 MAX_RETRIES = 5
@@ -29,7 +29,6 @@ def retry(func):
                     raise
         raise Exception("Max retries reached")
     return wrapper
-
 
 # -----------------------------
 # Garmin login
@@ -76,13 +75,13 @@ def fetch_health_for_date(client, date_str):
     date_str: 'yyyy-mm-dd'
     returns: dict (or None) with daily summary for that date
     """
-    # Probeer meerdere mogelijke client‑methodes (fallback) en laat exceptions door voor retry
     possible_methods = [
         "get_daily_summary",
         "get_daily_summary_by_date",
         "get_stats",
         "get_daily_stats",
-        "get_user_summary"
+        "get_user_summary",
+        "get_daily_health_summary"
     ]
 
     last_exc = None
@@ -98,14 +97,10 @@ def fetch_health_for_date(client, date_str):
                 return health
             except Exception as e:
                 last_exc = e
-                # als het een 429 of netwerkfout is, laat het omhoog gaan zodat retry wrapper het oppakt
                 if "429" in str(e) or "rate limit" in str(e).lower():
                     raise
-                # anders probeer volgende fallback
                 continue
 
-    # Als geen methode werkte: raise de laatste exception zodat retry kan optreden,
-    # of return None als er geen exception was maar geen data.
     if last_exc:
         raise last_exc
     return None
@@ -114,9 +109,6 @@ def fetch_health_for_date(client, date_str):
 # Fetch health for last N days
 # -----------------------------
 def fetch_health_last_n_days(client, n=7):
-    """
-    returns DataFrame with up to n rows, one per date (most recent first)
-    """
     rows = []
     today = pd.Timestamp.now().normalize()
     for i in range(n):
@@ -131,24 +123,25 @@ def fetch_health_last_n_days(client, n=7):
         else:
             print(f"No health summary for {d}")
     if not rows:
-        return pd.DataFrame(columns=['calendarDate'])  # empty df
+        return pd.DataFrame(columns=['calendarDate'])
     df = pd.DataFrame(rows)
-    # normalize calendarDate to string yyyy-mm-dd
     df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
     return df
 
-
 # -----------------------------
-# Append new rows for Sport
+# Append new rows for Sport (fixed + distance formatting)
 # -----------------------------
 def append_new_rows(sh, tab_name, df, key_column):
     try:
         ws = sh.worksheet(tab_name)
     except:
-        ws = sh.add_worksheet(title=tab_name, rows=2000, cols=20)
+        ws = sh.add_worksheet(title=tab_name, rows=2000, cols=max(20, len(df.columns)))
+        # format distance if present before initial append
+        if 'distance' in df.columns:
+            df['distance'] = format_distance_series(df['distance'])
         ws.update([df.columns.values.tolist()])
         print(f"Created sheet {tab_name}")
-        ws.append_rows(df.values.tolist())
+        ws.append_rows(df.astype(str).values.tolist())
         return
 
     existing = ws.get_all_records()
@@ -166,11 +159,40 @@ def append_new_rows(sh, tab_name, df, key_column):
         print(f"No new rows for {tab_name}")
         return
 
-    ws.append_rows(new_rows.values.tolist())
+    # format distance column for new rows if present
+    if 'distance' in new_rows.columns:
+        new_rows['distance'] = format_distance_series(new_rows['distance'])
+
+    ws.append_rows(new_rows.astype(str).values.tolist())
     print(f"Added {len(new_rows)} new rows to {tab_name}")
 
+# helper used by append_new_rows
+def format_distance_series(s):
+    try:
+        s = pd.to_numeric(s, errors='coerce')
+        if s.isna().all():
+            return s.astype(str)
+        # heuristiek: als max > 100 -> waarden in meters, zet om naar km
+        if s.max() > 100:
+            s = s / 1000.0
+        # rond af op 2 decimalen, maar verwijder .00 als integer
+        s = s.round(2)
+        def fmt(x):
+            if pd.isna(x):
+                return ""
+            if float(x).is_integer():
+                return str(int(x))
+            return f"{x:.2f}"
+        s = s.apply(fmt)
+        # vervang punt door komma voor NL locale
+        s = s.str.replace('.', ',', regex=False)
+        return s
+    except Exception as e:
+        print("Warning formatting distance:", e)
+        return s.astype(str)
+
 # -----------------------------
-# Helpers (module level) 
+# Helpers (module level)
 # -----------------------------
 def find_in_structure(obj, target_keys):
     """
@@ -184,7 +206,6 @@ def find_in_structure(obj, target_keys):
             k_norm = str(k).strip().lower()
             if k_norm in target_keys:
                 return v
-        # not direct match: recurse
         for v in obj.values():
             found = find_in_structure(v, target_keys)
             if found is not None:
@@ -210,12 +231,13 @@ def get_value_for_column(rec, col_name):
     if col_name.lower() in lower_map:
         return lower_map[col_name.lower()] if lower_map[col_name.lower()] is not None else ""
 
-    # combined alternative names mapping
+    # uitgebreide alternative names mapping
     alt_names = {
-        "steps": ["steps", "totalSteps", "stepCount", "dailySteps", "summarySteps"],
-        "weight": ["weight", "bodyWeight", "weightKg", "weight_kg", "weightInKg"],
-        "sleephours": ["sleepHours", "sleepDuration", "sleepMinutes", "totalSleepMinutes", "sleep"],
-        "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate"],
+        "steps": ["steps", "totalSteps", "stepCount", "dailySteps", "summarySteps", "summary_steps"],
+        "weight": ["weight", "bodyWeight", "weightKg", "weight_kg", "weightInKg", "body_weight", "userWeight"],
+        "sleephours": ["sleepHours", "sleepDuration", "sleepMinutes", "totalSleepMinutes", "sleep", "sleepSummary", "sleep_total_minutes"],
+        "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate", "resting_hr", "restingHeartRateBpm"],
+        "distance": ["distance", "totalDistance", "totalDistanceMeters", "distanceMeters", "distance_meters", "total_distance"]
     }
 
     key_norm = ''.join(ch for ch in col_name.lower() if ch.isalnum())
@@ -238,7 +260,7 @@ def get_value_for_column(rec, col_name):
     return ""
 
 # -----------------------------
-# UPSERT for Health (gspread) with robust date matching
+# UPSERT for Health (gspread) with robust date matching (no backup)
 # -----------------------------
 def upsert_health_rows(sh, df):
     """
@@ -293,7 +315,6 @@ def upsert_health_rows(sh, df):
 
     print("DEBUG: date_to_row map (sample):", dict(list(date_to_row.items())[:10]))
 
-    # Upsert helpers (module-level helpers assumed available: find_in_structure, get_value_for_column)
     # Debug sample of incoming record keys
     if len(df) > 0:
         print("DEBUG: sample incoming health record keys (first record):")
@@ -356,7 +377,7 @@ def upsert_health_rows(sh, df):
                 w = float(raw)
                 row_values[weight_idx] = str(w)
             except:
-                found = find_in_structure(rec_dict, {"weight", "bodyweight", "weightkg", "weight_kg"})
+                found = find_in_structure(rec_dict, {"weight", "bodyweight", "weightkg", "weight_kg", "userweight"})
                 if found is not None:
                     if isinstance(found, dict):
                         for k in ("value", "weight", "kg"):
@@ -384,8 +405,6 @@ def upsert_health_rows(sh, df):
             ws.append_row(row_values)
             print(f"Inserted new health row for {target_date}")
 
-
-
 # -----------------------------
 # Cleanup (robust header handling)
 # -----------------------------
@@ -393,7 +412,6 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
     print(f"Cleaning up sheet: {tab_name}")
 
     ws = sh.worksheet(tab_name)
-    # Read all values raw
     all_values = ws.get_all_values()
     if not all_values or len(all_values) == 0:
         print("Nothing to clean")
@@ -402,7 +420,6 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
     header = all_values[0]
     rows = all_values[1:]
 
-    # Normalize empty header cells to unique names: '' -> col_1, col_2, ...
     normalized_header = []
     seen = {}
     for i, h in enumerate(header):
@@ -416,7 +433,6 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
             seen[name] = 1
         normalized_header.append(name)
 
-    # Ensure each row has same number of columns as header
     max_cols = len(normalized_header)
     normalized_rows = []
     for r in rows:
@@ -424,17 +440,13 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
         normalized_rows.append(row[:max_cols])
 
     df = pd.DataFrame(normalized_rows, columns=normalized_header)
-
-    # drop fully empty rows
     df = df.dropna(how="all")
 
-    # dedupe on key_column if present
     if key_column not in df.columns:
         print(f"Warning: key_column '{key_column}' not found in normalized header; skipping dedupe")
     else:
         df = df.drop_duplicates(subset=[key_column], keep="first")
 
-    # sort if possible
     if sort_column in df.columns:
         try:
             df = df.sort_values(by=sort_column)
@@ -443,12 +455,10 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
     else:
         print(f"Warning: sort_column '{sort_column}' not found; skipping sort")
 
-    # write back
     ws.clear()
     values = [df.columns.tolist()] + df.values.tolist()
     ws.update(values)
     print(f"Cleanup done for {tab_name}: {len(df)} rows remain")
-
 
 # -----------------------------
 # MAIN
