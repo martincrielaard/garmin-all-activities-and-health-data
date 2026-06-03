@@ -1,11 +1,13 @@
 name: Garmin Connect Daily Sync
 
 on:
- ## schedule:
-    # Runs every day at 08:00 UTC
-    ## - cron: '0 4 * * *'
+  schedule:
+    - cron: "0 4 * * *"   # dagelijks om 04:00 UTC (pas aan naar jouw gewenste UTC tijd)
   workflow_dispatch:
-    # Allows you to run the sync manually from the "Actions" tab
+
+concurrency:
+  group: garmin-sync
+  cancel-in-progress: true
 
 jobs:
   sync:
@@ -18,25 +20,48 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+          cache: "pip"
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install garminconnect gspread google-auth pandas
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install garminconnect gspread google-auth pandas
+          fi
 
-      - name: Sync Activities
+      - name: Run sync (daily_sync.py or fallback to activities+health) with logging
         env:
           GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: python sync_activities.py
+        run: |
+          # Try daily_sync.py if present, otherwise run the two separate scripts.
+          if [ -f daily_sync.py ]; then
+            python daily_sync.py 2>&1 | tee sync.log
+            exit_code=${PIPESTATUS[0]}
+          else
+            python sync_activities.py 2>&1 | tee sync_activities.log
+            act_code=${PIPESTATUS[0]}
+            python sync_health.py 2>&1 | tee sync_health.log
+            hlth_code=${PIPESTATUS[0]}
+            # combine logs for convenience
+            cat sync_activities.log sync_health.log > sync.log || true
+            # prefer nonzero exit if any failed
+            if [ "${act_code}" != "0" ] || [ "${hlth_code}" != "0" ]; then
+              exit_code=1
+            else
+              exit_code=0
+            fi
+          fi
+          exit ${exit_code}
 
-      - name: Sync Health Data
-        env:
-          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
-          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: python sync_health.py
+      - name: Upload sync log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-log
+          path: sync.log
