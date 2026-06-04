@@ -4,6 +4,7 @@ import pandas as pd
 from garminconnect import Garmin
 import gspread
 import logging
+from gspread.exceptions import GSpreadException
 import re
 from google.oauth2.service_account import Credentials
 
@@ -11,24 +12,59 @@ MAX_RETRIES = 5
 RETRY_DELAY = 10
 
 
-
+def _make_unique_headers(headers):
+    """
+    Maak een lijst met unieke headernamen van een header-rij.
+    Lege namen worden 'blank', duplicaten krijgen suffix _1, _2, ...
+    """
+    seen = {}
+    out = []
+    for h in headers:
+        # normaliseer None naar lege string en strip whitespace
+        key = (h or "").strip()
+        base = key if key != "" else "blank"
+        if base in seen:
+            seen[base] += 1
+            out.append(f"{base}_{seen[base]}")
+        else:
+            seen[base] = 0
+            out.append(base)
+    return out
 
 def safe_get_all_records_manual(ws):
+    """
+    Fallback: lees raw values en bouw zelf records met unieke headers.
+    Logt originele headers en retourneert lijst van dicts.
+    """
     values = ws.get_all_values()
     if not values:
+        logging.info("Worksheet empty: get_all_values returned no rows.")
         return []
+
     headers = values[0]
     rows = values[1:]
+
     logging.warning("get_all_values returned headers: %s", headers)
-    # maak headers uniek
+
+    # Als alle headers leeg zijn, maak een generieke set kolomnamen op basis van max kolommen
+    if all((h is None or str(h).strip() == "") for h in headers):
+        max_cols = max((len(r) for r in rows), default=0)
+        headers = [f"col_{i+1}" for i in range(max_cols)]
+        logging.warning("Header row entirely empty — using generated headers: %s", headers)
+
     unique_headers = _make_unique_headers(headers)
+
     records = []
     for row in rows:
-        # vul ontbrekende cellen met lege string zodat zip altijd even lang is
+        # vul ontbrekende cellen met lege string zodat zip even lang is
         if len(row) < len(unique_headers):
             row = row + [""] * (len(unique_headers) - len(row))
+        # snip extra waarden als row langer is dan headers
+        if len(row) > len(unique_headers):
+            row = row[:len(unique_headers)]
         records.append(dict(zip(unique_headers, row)))
     return records
+
 
 # -----------------------------
 # Retry helper (exponential backoff)
@@ -164,7 +200,8 @@ def append_new_rows(sh, tab_name, df, key_column):
         print(f"Created sheet {tab_name}")
         ws.append_rows(df.astype(str).values.tolist())
         return
-
+        
+    _make_unique_headers
     existing = safe_get_all_records_manual(ws)
 
     if existing:
