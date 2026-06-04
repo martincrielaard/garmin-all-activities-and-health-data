@@ -3,11 +3,32 @@ import time
 import pandas as pd
 from garminconnect import Garmin
 import gspread
+import logging
 import re
 from google.oauth2.service_account import Credentials
 
 MAX_RETRIES = 5
 RETRY_DELAY = 10
+
+
+
+
+def safe_get_all_records_manual(ws):
+    values = ws.get_all_values()
+    if not values:
+        return []
+    headers = values[0]
+    rows = values[1:]
+    logging.warning("get_all_values returned headers: %s", headers)
+    # maak headers uniek
+    unique_headers = _make_unique_headers(headers)
+    records = []
+    for row in rows:
+        # vul ontbrekende cellen met lege string zodat zip altijd even lang is
+        if len(row) < len(unique_headers):
+            row = row + [""] * (len(unique_headers) - len(row))
+        records.append(dict(zip(unique_headers, row)))
+    return records
 
 # -----------------------------
 # Retry helper (exponential backoff)
@@ -144,7 +165,7 @@ def append_new_rows(sh, tab_name, df, key_column):
         ws.append_rows(df.astype(str).values.tolist())
         return
 
-    existing = ws.get_all_records()
+    existing = safe_get_all_records_manual(ws)
 
     if existing:
         existing_df = pd.DataFrame(existing)
