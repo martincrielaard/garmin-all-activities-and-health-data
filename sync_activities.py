@@ -1,6 +1,8 @@
+#!/usr/bin/env python3
 import os
 import json
 import time
+import hashlib
 import gspread
 from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
@@ -12,93 +14,172 @@ def get_garmin_client():
     return client
 
 def seconds_to_hms(seconds):
-    if not seconds: return "00:00:00"
+    if not seconds:
+        return "00:00:00"
     return str(timedelta(seconds=int(float(seconds))))
 
 def format_run_pace(ms):
-    if not ms or ms <= 0: return ""
+    if not ms or ms <= 0:
+        return ""
+    # ms = meters per second
     seconds_per_km = 1000 / ms
     return f"{int(seconds_per_km // 60):02d}:{int(seconds_per_km % 60):02d}"
 
 def format_swim_pace(ms):
-    if not ms or ms <= 0: return ""
+    if not ms or ms <= 0:
+        return ""
     seconds_100m = 100 / ms
     return f"{int(seconds_100m // 60):02d}:{int(seconds_100m % 60):02d}"
 
-def sync_activities():
-    # DYNAMISCHES DATUM: Heute minus 7 Tage
+def _row_checksum(rec):
+    """
+    Create a fallback id based on a checksum of a few stable fields.
+    """
+    s = "|".join(str(rec.get(k, "")) for k in ("startTimeLocal", "distance", "duration", "activityType"))
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+def get_clean_activities(client, lookback_days=7, start=0, limit=50):
+    """
+    Fetch activities from Garmin and return a cleaned pandas-like list of dicts (rows).
+    - Normalizes startTimeLocal to datetime
+    - Ensures activityId exists (fallback to checksum)
+    - Converts distance to km numeric where possible
+    - Drops duplicate activityId entries (keeps first)
+    Returns: list of dicts (cleaned activities)
+    """
+    import pandas as pd  # local import to keep module lightweight if not used elsewhere
+
+    activities = client.get_activities(start, limit)
+    if not activities:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(activities)
+
+    # Normalize startTimeLocal
+    if "startTimeLocal" in df.columns:
+        df["startTimeLocal"] = pd.to_datetime(df["startTimeLocal"], errors="coerce")
+
+    # Ensure activityId exists
+    if "activityId" in df.columns:
+        df["activityId"] = df["activityId"].astype(str)
+    else:
+        df["activityId"] = df.apply(lambda r: _row_checksum(r.to_dict()), axis=1)
+
+    # Distance numeric (km)
+    if "distance" in df.columns:
+        df["distance_km"] = pd.to_numeric(df["distance"], errors="coerce")
+        # If values look like meters (>100), convert to km
+        df.loc[df["distance_km"] > 100, "distance_km"] = df.loc[df["distance_km"] > 100, "distance_km"] / 1000.0
+
+    # Duration numeric
+    if "duration" in df.columns:
+        df["duration_s"] = pd.to_numeric(df["duration"], errors="coerce")
+
+    # activityType normalization (string)
+    if "activityType" in df.columns:
+        def _type_key(x):
+            try:
+                return (x or {}).get("typeKey", "").lower() if isinstance(x, dict) else str(x).lower()
+            except Exception:
+                return str(x).lower()
+        df["activityType_key"] = df["activityType"].apply(_type_key)
+
+    # Drop exact duplicate activityId rows
+    df = df.drop_duplicates(subset=["activityId"], keep="first").reset_index(drop=True)
+
+    # Filter by lookback_days
+    if "startTimeLocal" in df.columns:
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=lookback_days)
+        df = df[df["startTimeLocal"] >= cutoff]
+
+    return df
+
+def sync_activities_to_sheet():
+    """
+    Original-style sync function that appends new activities to the 'Sport' sheet.
+    Uses get_clean_activities to centralize normalization/dedupe logic.
+    """
+    import pandas as pd
+
     lookback_days = 7
-    stop_date = datetime.now() - timedelta(days=lookback_days)
-    
-    print(f"🚀 Starte Daily Sport Sync (Letzte {lookback_days} Tage)...")
+    print(f"🚀 Start Daily Sport Sync (last {lookback_days} days)...")
     client = get_garmin_client()
-    
+
     # Google Sheets Auth
     gc = gspread.authorize(Credentials.from_service_account_info(
-        json.loads(os.environ.get('GOOGLE_CREDENTIALS')), 
+        json.loads(os.environ.get('GOOGLE_CREDENTIALS')),
         scopes=['https://www.googleapis.com/auth/spreadsheets']
     ))
     sh = gc.open_by_key(os.environ.get('SHEET_ID'))
     sport_sheet = sh.worksheet("Sport")
 
-    # Vorhandene IDs laden
+    # Load existing IDs from sheet (defensive)
     all_rows = sport_sheet.get_all_values()
     existing_ids = [row[10] for row in all_rows if len(row) > 10]
-    
-    activities = client.get_activities(0, 50)
+
+    df = get_clean_activities(client, lookback_days=lookback_days, start=0, limit=50)
+    if df.empty:
+        print("  💤 No activities fetched.")
+        return
+
     new_rows = []
+    for _, act in df.iterrows():
+        start_time = act.get("startTimeLocal")
+        start_time_str = start_time.strftime("%Y-%m-%d %H:%M:%S") if not pd.isna(start_time) else ""
+        act_date_iso = start_time_str[:10] if start_time_str else ""
 
-    for act in activities:
-        start_time_str = act.get('startTimeLocal', '')
-        if not start_time_str:
-            continue
-
-        # Release 2: Sauberes Datums-Parsing
-        act_date = datetime.strptime(start_time_str[:10], '%Y-%m-%d')
-        
-        if act_date < stop_date:
-            continue
-
-        act_id = str(act.get('activityId'))
+        act_id = str(act.get("activityId", ""))
         if act_id in existing_ids:
             continue
 
-        type_key = act.get('activityType', {}).get('typeKey', '').lower()
-        
-        # Release 2: Cadence & SWOLF Logik für Spalte I
-        # 1. Prüfen auf Schwimmen -> SWOLF
-        # 2. Prüfen auf Laufen/Rad -> Cadence
-        swolf = act.get('averageSwolf')
+        type_key = act.get("activityType_key", "")
+        # cadence / swolf logic
+        swolf = act.get("averageSwolf") if "averageSwolf" in act else None
         cadence = (
-            act.get('averageRunningCadenceInStepsPerMinute') or 
-            act.get('averageCadence') or 
-            act.get('averageBikingCadenceInRevPerMinute') or 
+            act.get('averageRunningCadenceInStepsPerMinute') or
+            act.get('averageCadence') or
+            act.get('averageBikingCadenceInRevPerMinute') or
             0
         )
-        
-        # Wert für Spalte I entscheiden
-        if "swimming" in type_key and swolf:
+        if "swimming" in str(type_key) and swolf:
             value_col_i = round(swolf, 0)
         else:
             value_col_i = round(cadence, 0) if cadence else 0
 
-        avg_speed_ms = round(act.get('averageSpeed', 0), 3)
-        pace_run = format_run_pace(avg_speed_ms) if "running" in type_key else ""
-        speed_bike = round(avg_speed_ms * 3.6, 2) if any(x in type_key for x in ["cycling", "biking"]) else ""
-        pace_swim = format_swim_pace(avg_speed_ms) if "swimming" in type_key else ""
+        avg_speed_ms = round(act.get('averageSpeed', 0) or 0, 3)
+        pace_run = format_run_pace(avg_speed_ms) if "running" in str(type_key) else ""
+        speed_bike = round(avg_speed_ms * 3.6, 2) if any(x in str(type_key) for x in ["cycling", "biking"]) else ""
+        pace_swim = format_swim_pace(avg_speed_ms) if "swimming" in str(type_key) else ""
 
-        # Zeile vorbereiten
+        distance_km = None
+        if "distance_km" in act and not pd.isna(act["distance_km"]):
+            distance_km = round(float(act["distance_km"]), 2)
+        else:
+            # fallback to raw distance if present (and convert meters->km)
+            raw = act.get("distance")
+            try:
+                raw_n = float(raw)
+                if raw_n > 100:
+                    distance_km = round(raw_n / 1000.0, 2)
+                else:
+                    distance_km = round(raw_n, 2)
+            except Exception:
+                distance_km = ""
+
+        duration_s = act.get("duration_s") if "duration_s" in act else act.get("duration", 0)
+        duration_hms = seconds_to_hms(duration_s)
+
         new_rows.append([
-            start_time_str[:10],                # Release 2: Datum (ISO)
+            act_date_iso,
             act.get('activityName', '-'),
             type_key,
-            round(act.get('distance', 0) / 1000, 2),
-            seconds_to_hms(act.get('duration', 0)),
+            distance_km,
+            duration_hms,
             act.get('calories', 0),
             act.get('averageHR', 0),
             act.get('maxHR', 0),
-            value_col_i,                        # Release 2: SWOLF (Schwimmen) oder Cadence (Rad/Lauf)
-            round(act.get('elevationGain', 0), 0),
+            value_col_i,
+            round(act.get('elevationGain', 0) or 0, 0),
             act_id,
             avg_speed_ms,
             pace_run,
@@ -107,12 +188,12 @@ def sync_activities():
         ])
 
     if new_rows:
+        # keep chronological order (oldest first) so append_rows adds newest at bottom
         new_rows.reverse()
-        # Release 2: USER_ENTERED für automatische Typ-Erkennung
         sport_sheet.append_rows(new_rows, value_input_option='USER_ENTERED')
-        print(f"  ✅ {len(new_rows)} neue Aktivitäten hinzugefügt.")
+        print(f"  ✅ {len(new_rows)} new activities added.")
     else:
-        print("  💤 Alles aktuell.")
+        print("  💤 All up to date.")
 
 if __name__ == "__main__":
-    sync_activities()
+    sync_activities_to_sheet()
