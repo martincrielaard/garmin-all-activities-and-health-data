@@ -5,25 +5,21 @@ import pandas as pd
 from garminconnect import Garmin
 import gspread
 import logging
-from gspread.exceptions import GSpreadException
 import re
 from google.oauth2.service_account import Credentials
 
-# Import centralized activity cleaning
+# Use centralized cleaning
 from sync_activities import get_clean_activities
 
 MAX_RETRIES = 5
 RETRY_DELAY = 10
 
-# configure basic logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
 
-
+# -----------------------------
+# Small helpers
+# -----------------------------
 def _make_unique_headers(headers):
-    """
-    Maak een lijst met unieke headernamen van een header-rij.
-    Lege namen worden 'blank' (of col_N), duplicaten krijgen suffix _1, _2, ...
-    """
     seen = {}
     out = []
     for i, h in enumerate(headers):
@@ -37,30 +33,19 @@ def _make_unique_headers(headers):
             out.append(base)
     return out
 
-
 def safe_get_all_records_manual(ws):
-    """
-    Fallback: lees raw values en bouw zelf records met unieke headers.
-    Logt originele headers en retourneert lijst van dicts.
-    """
     values = ws.get_all_values()
     if not values:
         logging.info("Worksheet empty: get_all_values returned no rows.")
         return []
-
     headers = values[0]
     rows = values[1:]
-
     logging.warning("get_all_values returned headers: %s", headers)
-
-    # Als alle headers leeg zijn, maak een generieke set kolomnamen op basis van max kolommen
     if all((h is None or str(h).strip() == "") for h in headers):
         max_cols = max((len(r) for r in rows), default=0)
         headers = [f"col_{i+1}" for i in range(max_cols)]
         logging.warning("Header row entirely empty — using generated headers: %s", headers)
-
     unique_headers = _make_unique_headers(headers)
-
     records = []
     for row in rows:
         if len(row) < len(unique_headers):
@@ -70,10 +55,6 @@ def safe_get_all_records_manual(ws):
         records.append(dict(zip(unique_headers, row)))
     return records
 
-
-# -----------------------------
-# Retry helper (exponential backoff)
-# -----------------------------
 def retry(func):
     def wrapper(*args, **kwargs):
         delay = RETRY_DELAY
@@ -93,10 +74,6 @@ def retry(func):
         raise Exception("Max retries reached")
     return wrapper
 
-
-# -----------------------------
-# Garmin login
-# -----------------------------
 @retry
 def garmin_login():
     logging.info("Logging in to Garmin...")
@@ -105,10 +82,6 @@ def garmin_login():
     logging.info("Garmin login OK")
     return client
 
-
-# -----------------------------
-# Google Sheets client
-# -----------------------------
 def sheets_client():
     creds = Credentials.from_service_account_info(
         eval(os.environ["GOOGLE_CREDENTIALS"]),
@@ -118,18 +91,10 @@ def sheets_client():
     sh = gc.open_by_key(os.environ["SHEET_ID"])
     return sh
 
-
 # -----------------------------
-# Append new rows for Sport (fixed + distance formatting)
+# Distance formatting helper
 # -----------------------------
 def format_distance_series(s):
-    """
-    Format a pandas Series of distances for human-friendly display.
-    Heuristics:
-      - try numeric conversion
-      - if numeric max > 100 assume meters and convert to km
-      - return strings with comma as decimal separator (existing behaviour)
-    """
     try:
         numeric = pd.to_numeric(s, errors='coerce')
         if numeric.notna().any() and numeric.max() > 100:
@@ -148,16 +113,19 @@ def format_distance_series(s):
         logging.warning("Warning formatting distance: %s", e)
         return s.astype(str)
 
-
+# -----------------------------
+# Append new rows (robust)
+# -----------------------------
 def append_new_rows(sh, tab_name, df, key_column):
-    """
-    Append new rows from df into sheet tab_name.
-    key_column: column name in df used as unique key (e.g., 'activityId')
-    """
+    if df is None or df.empty:
+        logging.info("No incoming rows to append for %s", tab_name)
+        return
+
     if key_column not in df.columns:
         logging.error("Incoming dataframe missing key column '%s' — aborting append", key_column)
         return
 
+    df = df.copy()
     df[key_column] = df[key_column].astype(str)
     before_in = len(df)
     df = df.drop_duplicates(subset=[key_column], keep="first").reset_index(drop=True)
@@ -184,41 +152,91 @@ def append_new_rows(sh, tab_name, df, key_column):
         logging.info("Created sheet %s with headers: %s", tab_name, header)
         return
 
+    # read existing rows robustly and determine existing keys by best-match header
     existing = safe_get_all_records_manual(ws)
-
+    existing_keys = set()
     if existing:
         existing_df = pd.DataFrame(existing)
-        if key_column not in existing_df.columns:
-            logging.warning("Key column '%s' not found in sheet headers: %s", key_column, existing_df.columns.tolist())
-            candidates = [c for c in existing_df.columns if re.search(r'activity|id', c, re.IGNORECASE)]
-            if candidates:
-                guessed = candidates[0]
-                logging.info("Using guessed key column '%s' for existing rows", guessed)
-                existing_keys = set(existing_df[guessed].astype(str))
-            else:
-                logging.warning("No suitable key column found; treating sheet as empty for dedupe")
-                existing_keys = set()
-        else:
+        # try to find a column that looks like activityId
+        candidates = [c for c in existing_df.columns if re.search(r'activity|id', c, re.IGNORECASE)]
+        if candidates:
+            guessed = candidates[0]
+            existing_keys = set(existing_df[guessed].astype(str))
+            logging.debug("Using existing key column '%s' for dedupe", guessed)
+        elif key_column in existing_df.columns:
             existing_keys = set(existing_df[key_column].astype(str))
+        else:
+            # fallback: if sheet has at least 11 columns, use index 10
+            if existing_df.shape[1] > 10:
+                existing_keys = set(existing_df.iloc[:, 10].astype(str))
+            else:
+                existing_keys = set()
     else:
         existing_keys = set()
 
-    new_rows = df[~df[key_column].isin(existing_keys)]
-
-    if new_rows.empty:
+    new_rows_df = df[~df[key_column].isin(existing_keys)]
+    if new_rows_df.empty:
         logging.info("No new rows for %s", tab_name)
         return
 
-    if 'distance' in new_rows.columns:
-        new_rows['distance'] = format_distance_series(new_rows['distance'])
+    if 'distance' in new_rows_df.columns:
+        new_rows_df['distance'] = format_distance_series(new_rows_df['distance'])
 
-    ws.append_rows(new_rows.astype(str).values.tolist())
-    logging.info("Added %d new rows to %s", len(new_rows), tab_name)
-
+    ws.append_rows(new_rows_df.astype(str).values.tolist())
+    logging.info("Added %d new rows to %s", len(new_rows_df), tab_name)
 
 # -----------------------------
-# Helpers (module level)
+# Health fetch helpers (copied/complete)
 # -----------------------------
+@retry
+def fetch_health_for_date(client, date_str):
+    possible_methods = [
+        "get_daily_summary",
+        "get_daily_summary_by_date",
+        "get_stats",
+        "get_daily_stats",
+        "get_user_summary",
+        "get_daily_health_summary"
+    ]
+    last_exc = None
+    for m in possible_methods:
+        if hasattr(client, m):
+            try:
+                func = getattr(client, m)
+                health = func(date_str)
+                if not health:
+                    return None
+                health['calendarDate'] = pd.to_datetime(health.get('calendarDate', date_str)).date()
+                return health
+            except Exception as e:
+                last_exc = e
+                if "429" in str(e) or "rate limit" in str(e).lower():
+                    raise
+                continue
+    if last_exc:
+        raise last_exc
+    return None
+
+def fetch_health_last_n_days(client, n=7):
+    rows = []
+    today = pd.Timestamp.now().normalize()
+    for i in range(n):
+        d = (today - pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            rec = fetch_health_for_date(client, d)
+        except Exception as e:
+            logging.warning("Could not fetch health for %s: %s", d, e)
+            rec = None
+        if rec:
+            rows.append(rec)
+        else:
+            logging.info("No health summary for %s", d)
+    if not rows:
+        return pd.DataFrame(columns=['calendarDate'])
+    df = pd.DataFrame(rows)
+    df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
+    return df
+
 def find_in_structure(obj, target_keys):
     if obj is None:
         return None
@@ -238,7 +256,6 @@ def find_in_structure(obj, target_keys):
                 return found
     return None
 
-
 def get_value_for_column(rec, col_name):
     if rec is None:
         return ""
@@ -247,7 +264,6 @@ def get_value_for_column(rec, col_name):
     lower_map = {str(k).lower(): v for k, v in rec.items()}
     if col_name.lower() in lower_map:
         return lower_map[col_name.lower()] if lower_map[col_name.lower()] is not None else ""
-
     alt_names = {
         "steps": ["steps", "totalSteps", "stepCount", "dailySteps", "summarySteps", "summary_steps"],
         "weight": ["weight", "bodyWeight", "weightKg", "weight_kg", "weightInKg", "body_weight", "userWeight"],
@@ -255,28 +271,20 @@ def get_value_for_column(rec, col_name):
         "restingheartrate": ["restingHeartRate", "restingHR", "resting_heart_rate", "resting_hr", "restingHeartRateBpm"],
         "distance": ["distance", "totalDistance", "totalDistanceMeters", "distanceMeters", "distance_meters", "total_distance"]
     }
-
     key_norm = ''.join(ch for ch in col_name.lower() if ch.isalnum())
     if key_norm in alt_names:
         targets = [n.lower() for n in alt_names[key_norm]]
         found = find_in_structure(rec, set(targets))
         if found is not None:
             return found
-
     for k, v in rec.items():
         if col_name.lower() in str(k).lower():
             return v if v is not None else ""
-
     found = find_in_structure(rec, {col_name.lower(), key_norm})
     if found is not None:
         return found
-
     return ""
 
-
-# -----------------------------
-# UPSERT for Health (gspread) with robust date matching (no backup)
-# -----------------------------
 def upsert_health_rows(sh, df):
     ws_title = "Health"
     try:
@@ -292,7 +300,6 @@ def upsert_health_rows(sh, df):
         return
 
     df["calendarDate"] = pd.to_datetime(df["calendarDate"]).dt.strftime("%Y-%m-%d")
-
     all_values = ws.get_all_values()
     if not all_values:
         header = df.columns.tolist()
@@ -302,9 +309,6 @@ def upsert_health_rows(sh, df):
     else:
         header = all_values[0]
         existing_rows = all_values[1:]
-
-    logging.debug("sheet header: %s", header)
-    logging.debug("first 5 existing rows: %s", existing_rows[:5])
 
     try:
         date_col_idx = header.index("calendarDate")
@@ -321,11 +325,6 @@ def upsert_health_rows(sh, df):
                 date_to_row[str(row[date_col_idx])[:10]] = i
             except Exception:
                 continue
-
-    logging.debug("date_to_row map (sample): %s", dict(list(date_to_row.items())[:10]))
-
-    if len(df) > 0:
-        logging.debug("sample incoming health record keys (first record): %s", df.iloc[0].to_dict())
 
     for _, rec in df.iterrows():
         rec_dict = rec.to_dict()
@@ -395,7 +394,6 @@ def upsert_health_rows(sh, df):
                         if m:
                             row_values[weight_idx] = m.group(0)
 
-        logging.debug("processing incoming date %s", target_date)
         if target_date in date_to_row:
             sheet_row = date_to_row[target_date]
             logging.info("match found for %s at sheet row %d — updating", target_date, sheet_row)
@@ -407,22 +405,18 @@ def upsert_health_rows(sh, df):
             ws.append_row(row_values)
             logging.info("Inserted new health row for %s", target_date)
 
-
 # -----------------------------
-# Cleanup (robust header handling)
+# Cleanup sheet
 # -----------------------------
 def cleanup_sheet(sh, tab_name, key_column, sort_column):
     logging.info("Cleaning up sheet: %s", tab_name)
-
     ws = sh.worksheet(tab_name)
     all_values = ws.get_all_values()
     if not all_values or len(all_values) == 0:
         logging.info("Nothing to clean")
         return
-
     header = all_values[0]
     rows = all_values[1:]
-
     normalized_header = []
     seen = {}
     for i, h in enumerate(header):
@@ -435,21 +429,17 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
         else:
             seen[name] = 1
         normalized_header.append(name)
-
     max_cols = len(normalized_header)
     normalized_rows = []
     for r in rows:
         row = list(r) + [""] * (max_cols - len(r))
         normalized_rows.append(row[:max_cols])
-
     df = pd.DataFrame(normalized_rows, columns=normalized_header)
     df = df.dropna(how="all")
-
     if key_column not in df.columns:
         logging.warning("key_column '%s' not found in normalized header; skipping dedupe", key_column)
     else:
         df = df.drop_duplicates(subset=[key_column], keep="first")
-
     if sort_column in df.columns:
         try:
             df = df.sort_values(by=sort_column)
@@ -457,42 +447,33 @@ def cleanup_sheet(sh, tab_name, key_column, sort_column):
             df = df.sort_values(by=sort_column, key=lambda s: s.astype(str))
     else:
         logging.warning("sort_column '%s' not found; skipping sort", sort_column)
-
     ws.clear()
     values = [df.columns.tolist()] + df.values.tolist()
     ws.update(values)
     logging.info("Cleanup done for %s: %d rows remain", tab_name, len(df))
-
 
 # -----------------------------
 # MAIN
 # -----------------------------
 def main():
     logging.info("=== INCREMENTAL DAILY SYNC START ===")
-
     client = garmin_login()
     sh = sheets_client()
 
-    # If Sport sheet has generic headers (col_1...), try to replace with df_activities header
+    # Try to fix generic headers if present by deriving header from a small preview
     try:
         ws_sport = sh.worksheet("Sport")
         header_vals = ws_sport.get_all_values()
         if header_vals and header_vals[0] and header_vals[0][0].startswith("col_"):
-            # fetch a cleaned activities df to derive header
-            try:
-                df_preview = get_clean_activities(client, lookback_days=7, start=0, limit=10)
-                if not df_preview.empty:
-                    new_header = _make_unique_headers(df_preview.columns.tolist())
-                    ws_sport.update([new_header])
-                    logging.info("Replaced generic Sport header with: %s", new_header)
-                else:
-                    logging.debug("No preview activities to set header from.")
-            except Exception as e:
-                logging.debug("Could not set Sport header from preview: %s", e)
+            df_preview = get_clean_activities(client, lookback_days=7, start=0, limit=10)
+            if not df_preview.empty:
+                new_header = _make_unique_headers(df_preview.columns.tolist())
+                ws_sport.update([new_header])
+                logging.info("Replaced generic Sport header with: %s", new_header)
     except Exception as e:
         logging.debug("Header-fix check skipped or failed: %s", e)
 
-    # Sport (incremental append)
+    # Normalize and dedupe existing sheet first
     try:
         cleanup_sheet(sh, "Sport", key_column="activityId", sort_column="startTimeLocal")
     except Exception as e:
@@ -512,10 +493,9 @@ def main():
     except Exception as e:
         logging.warning("cleanup after append failed: %s", e)
 
-    # Health (UPSERT) - fetch last 7 days and upsert
+    # Health (UPSERT)
     df_health = fetch_health_last_n_days(client, n=7)
     logging.info("DEBUG: fetched health rows: %s", df_health)
-
     if not df_health.empty:
         upsert_health_rows(sh, df_health)
         try:
@@ -526,7 +506,6 @@ def main():
         logging.info("No health rows fetched for last 7 days")
 
     logging.info("=== INCREMENTAL DAILY SYNC DONE ===")
-
 
 if __name__ == "__main__":
     main()
