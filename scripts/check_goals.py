@@ -16,13 +16,6 @@ def sheets_client():
     return gspread.authorize(creds)
 
 def read_dashboard_sheet():
-    """
-    Lees het Dashboard-blad en retourneer een DataFrame met kolommen:
-    - date (kolom A)
-    - distance (kolom B)
-    - steps (kolom C)
-    Verwacht dat de eerste rij headers bevat; als niet, wordt de eerste rij als header gebruikt.
-    """
     gc = sheets_client()
     sh = gc.open_by_key(SHEET_ID)
     try:
@@ -34,10 +27,7 @@ def read_dashboard_sheet():
     if not vals or len(vals) < 2:
         return pd.DataFrame()
 
-    header = vals[0]
     rows = vals[1:]
-
-    # Zorg dat elke rij minstens 3 kolommen heeft
     normalized = []
     for r in rows:
         row = list(r) + [""] * max(0, 3 - len(r))
@@ -65,13 +55,6 @@ def parse_int(x):
         return None
 
 def goal_combinations_met(km, steps):
-    """
-    Jouw combinaties:
-      - >= 10.000 stappen
-      - of >= 25 km en >= 5.000 stappen
-      - of >= 100 km en >= 1.000 stappen
-    Retourneert (bool, reason_string)
-    """
     if steps is not None and steps >= 10000:
         return True, "≥ 10.000 stappen"
     if km is not None and steps is not None and km >= 25 and steps >= 5000:
@@ -86,20 +69,26 @@ def main():
     except Exception as e:
         body = f"Fout bij lezen van Dashboard sheet: {e}\n"
         print(body)
-        os.makedirs("scripts", exist_ok=True)
-        with open("scripts/goals_email.txt", "w", encoding="utf-8") as f:
+        # schrijf naar workspace zodat workflow het bestand altijd kan vinden
+        workspace = os.environ.get("GITHUB_WORKSPACE", ".")
+        out_dir = os.path.join(workspace, "scripts")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "goals_email.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(body)
         return
 
     if df.empty:
         body = "Geen data in Dashboard sheet gevonden.\n"
         print(body)
-        os.makedirs("scripts", exist_ok=True)
-        with open("scripts/goals_email.txt", "w", encoding="utf-8") as f:
+        workspace = os.environ.get("GITHUB_WORKSPACE", ".")
+        out_dir = os.path.join(workspace, "scripts")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "goals_email.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(body)
         return
 
-    # Parse datum (eerste 10 tekens) en numerieke kolommen
     df["date_parsed"] = pd.to_datetime(df["date"].astype(str).str[:10], errors="coerce")
     df["_dist"] = df["distance"].apply(parse_number)
     df["_steps"] = df["steps"].apply(parse_int)
@@ -144,11 +133,14 @@ def main():
 
     body = "\n".join(lines)
 
-    os.makedirs("scripts", exist_ok=True)
-    out_path = os.path.join("scripts", "goals_email.txt")
+    # Schrijf expliciet naar de runner workspace zodat de workflowstappen het bestand altijd vinden
+    workspace = os.environ.get("GITHUB_WORKSPACE", ".")
+    out_dir = os.path.join(workspace, "scripts")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "goals_email.txt")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(body)
-
+    print(f"Wrote email body to: {out_path}")
     print(body)
 
 if __name__ == "__main__":
