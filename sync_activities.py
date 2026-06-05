@@ -104,7 +104,7 @@ def get_clean_activities(client, lookback_days=7, start=0, limit=50):
 # -----------------------------
 def sync_activities_to_sheet(lookback_days=7, start=0, limit=50):
     """
-    Fetch cleaned activities and append only truly new activities to the 'Sport' sheet.
+    Fetch cleaned activities and update existing rows or append new ones.
     """
     print(f"🚀 Start Daily Sport Sync (last {lookback_days} days)...")
     client = get_garmin_client()
@@ -117,45 +117,42 @@ def sync_activities_to_sheet(lookback_days=7, start=0, limit=50):
     sh = gc.open_by_key(os.environ.get('SHEET_ID'))
     sport_sheet = sh.worksheet("Sport")
 
-    # Load existing IDs from sheet robustly: try to find a header column that looks like activityId
+    # Read all values and build existing_id -> row_number map (1-based)
     all_values = sport_sheet.get_all_values()
-    existing_ids = set()
+    existing_map = {}  # id -> sheet_row_number
+    header = []
     if all_values:
         header = all_values[0]
-        # find index of column that contains 'activity' or 'id'
-        idx = None
+        # try to find a header column that looks like activityId (case-insensitive)
+        id_idx = None
         for i, h in enumerate(header):
-            if h and ("activity" in h.lower() or "id" in h.lower()):
-                idx = i
+            if h and ("activityid" == h.strip().lower() or "activityid" in h.strip().lower() or "activity" in h.strip().lower() or "id" == h.strip().lower()):
+                id_idx = i
                 break
-        if idx is not None:
-            for row in all_values[1:]:
-                if len(row) > idx and row[idx] not in ("", None):
-                    existing_ids.add(str(row[idx]))
-        else:
-            # fallback: if sheet has at least 11 columns, assume column 11 (index 10) is activityId (legacy)
-            if len(header) > 10:
-                for row in all_values[1:]:
-                    if len(row) > 10 and row[10]:
-                        existing_ids.add(str(row[10]))
+        # fallback: legacy index 10 if present
+        if id_idx is None and len(header) > 10:
+            id_idx = 10
+        if id_idx is not None:
+            for rownum, row in enumerate(all_values[1:], start=2):
+                if len(row) > id_idx and row[id_idx] not in ("", None):
+                    existing_map[str(row[id_idx])] = rownum
 
     df = get_clean_activities(client, lookback_days=lookback_days, start=start, limit=limit)
     if df.empty:
         print("  💤 No activities fetched.")
         return
 
-    new_rows = []
+    # Prepare rows and decide update vs append
+    rows_to_append = []
+    updates = []  # list of tuples (row_number, row_values)
     for _, act in df.iterrows():
         start_time = act.get("startTimeLocal")
         start_time_str = start_time.strftime("%Y-%m-%d %H:%M:%S") if not pd.isna(start_time) else ""
         act_date_iso = start_time_str[:10] if start_time_str else ""
 
         act_id = str(act.get("activityId", ""))
-        if act_id in existing_ids:
-            continue
-
         type_key = act.get("activityType_key", "")
-        # cadence / swolf logic
+
         swolf = act.get("averageSwolf") if "averageSwolf" in act else None
         cadence = (
             act.get('averageRunningCadenceInStepsPerMinute') or
@@ -190,7 +187,7 @@ def sync_activities_to_sheet(lookback_days=7, start=0, limit=50):
         duration_s = act.get("duration_s") if "duration_s" in act else act.get("duration", 0)
         duration_hms = seconds_to_hms(duration_s)
 
-        new_rows.append([
+        row_values = [
             act_date_iso,
             act.get('activityName', '-'),
             type_key,
@@ -206,15 +203,29 @@ def sync_activities_to_sheet(lookback_days=7, start=0, limit=50):
             pace_run,
             speed_bike,
             pace_swim
-        ])
+        ]
 
-    if new_rows:
-        # keep chronological order (oldest first) so append_rows adds newest at bottom
-        new_rows.reverse()
-        sport_sheet.append_rows(new_rows, value_input_option='USER_ENTERED')
-        print(f"  ✅ {len(new_rows)} new activities added.")
+        if act_id in existing_map:
+            updates.append((existing_map[act_id], row_values))
+        else:
+            rows_to_append.append(row_values)
+
+    # Perform updates (one by one; Google Sheets API requires a range per update)
+    for rownum, values in updates:
+        try:
+            range_name = f"A{rownum}"
+            sport_sheet.update(range_name, [values])
+        except Exception as e:
+            print(f"  ⚠️ Update failed for row {rownum}: {e}")
+
+    # Append new rows in one batch
+    if rows_to_append:
+        rows_to_append.reverse()
+        sport_sheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
+        print(f"  ✅ {len(rows_to_append)} new activities added.")
     else:
-        print("  💤 All up to date.")
+        print("  💤 No new activities to append.")
+
 
 
 if __name__ == "__main__":
