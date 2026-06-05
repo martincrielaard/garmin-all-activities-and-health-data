@@ -157,7 +157,6 @@ def append_new_rows(sh, tab_name, df, key_column):
     existing_map = {}
     if all_values:
         header = all_values[0]
-        # find best candidate column index for key_column
         key_idx = None
         for i, h in enumerate(header):
             if h and (h.strip().lower() == key_column.lower() or key_column.lower() in h.strip().lower() or "activity" in h.strip().lower() or "id" in h.strip().lower()):
@@ -173,25 +172,46 @@ def append_new_rows(sh, tab_name, df, key_column):
     # Prepare updates and appends
     updates = []      # (rownum, values)
     to_append = []    # values
-    # Try to align values with sheet header if possible
     sheet_header = all_values[0] if all_values else None
+
+    def _serialize_cell(v):
+        # convert pandas / numpy / datetime types to JSON-safe strings
+        try:
+            if v is None:
+                return ""
+            # pandas Timestamp
+            if isinstance(v, pd.Timestamp):
+                return v.strftime("%Y-%m-%d %H:%M:%S")
+            # datetime
+            if isinstance(v, (datetime,)):
+                return v.strftime("%Y-%m-%d %H:%M:%S")
+            # numpy types or pandas NA
+            if pd.isna(v):
+                return ""
+            # bool/int/float -> keep as-is (gspread will accept numeric types), but convert numpy scalars
+            if isinstance(v, (int, float, bool)):
+                return v
+            # otherwise string
+            return str(v)
+        except Exception:
+            return str(v)
+
     for _, r in df.iterrows():
-        # If sheet header exists, build values in that order; otherwise use df.columns order
+        # Build values aligned to sheet header if possible
         if sheet_header:
             values = []
             for col in sheet_header:
-                # if col matches a df column (case-insensitive), use that value
                 match = None
                 for c in df.columns:
                     if c and c.strip().lower() == str(col).strip().lower():
                         match = c
                         break
                 if match:
-                    values.append(r.get(match, ""))
+                    values.append(_serialize_cell(r.get(match, "")))
                 else:
                     values.append("")
         else:
-            values = [r.get(c, "") for c in df.columns]
+            values = [_serialize_cell(r.get(c, "")) for c in df.columns]
 
         key = str(r[key_column])
         if key in existing_map:
@@ -199,20 +219,33 @@ def append_new_rows(sh, tab_name, df, key_column):
         else:
             to_append.append(values)
 
-    # Execute updates
+    # Execute updates (one-by-one)
     for rownum, values in updates:
         try:
             ws.update(f"A{rownum}", [values])
         except Exception as e:
             logging.warning("Failed to update row %d: %s", rownum, e)
 
-    # Batch append remaining rows
+    # Batch append remaining rows (ensure all values are JSON-safe)
     if to_append:
+        # keep chronological order (oldest first)
         to_append.reverse()
-        ws.append_rows(to_append, value_input_option='USER_ENTERED')
-        logging.info("Added %d new rows to %s", len(to_append), tab_name)
+        # ensure inner lists contain only primitives/strings
+        safe_to_append = []
+        for row in to_append:
+            safe_row = []
+            for cell in row:
+                # leave numeric types as-is, convert others to string
+                if isinstance(cell, (int, float, bool)):
+                    safe_row.append(cell)
+                else:
+                    safe_row.append("" if cell is None else str(cell))
+            safe_to_append.append(safe_row)
+        ws.append_rows(safe_to_append, value_input_option='USER_ENTERED')
+        logging.info("Added %d new rows to %s", len(safe_to_append), tab_name)
     else:
         logging.info("No new rows for %s", tab_name)
+
 
 # -----------------------------
 # Health helpers (copied from previous implementation)
