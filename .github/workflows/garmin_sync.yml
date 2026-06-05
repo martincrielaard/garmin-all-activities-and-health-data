@@ -71,7 +71,7 @@ jobs:
           cat scripts/goals_email.txt || true
           cat scripts/goals_email.log || true
 
-            - name: Debug email body (workspace check)
+      - name: Debug email body (workspace check)
         run: |
           workspace=${GITHUB_WORKSPACE:-$(pwd)}
           echo "Workspace: $workspace"
