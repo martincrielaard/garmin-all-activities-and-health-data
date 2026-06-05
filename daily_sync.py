@@ -212,6 +212,44 @@ def fetch_health_last_n_days(client, n=7):
 # -----------------------------
 # Append new rows for Sport (fixed + distance formatting)
 # -----------------------------
+
+
+# helper used by append_new_rows
+def format_distance_series(s):
+    """
+    Format a pandas Series of distances for human-friendly display.
+    Heuristics:
+      - try numeric conversion
+      - if numeric max > 100 assume meters and convert to km
+      - return strings with comma as decimal separator (existing behaviour)
+    Note: this returns strings for sheet display. If you need numeric km values,
+    create a separate numeric column (distance_km) before calling this.
+    """
+    try:
+        numeric = pd.to_numeric(s, errors='coerce')
+        # heuristiek meters->km
+        if numeric.notna().any() and numeric.max() > 100:
+            numeric = numeric / 1000.0
+        # format: behoud zoveel decimalen als aanwezig (strip trailing zeros optioneel)
+        def fmt_val(x):
+            if pd.isna(x):
+                return ""
+            # convert to string with full precision, then normalize decimal separator
+            txt = repr(float(x))
+            # remove scientific notation if any
+            if 'e' in txt or 'E' in txt:
+                txt = f"{float(x):f}"
+            # strip trailing zeros and optional trailing dot
+            if '.' in txt:
+                txt = txt.rstrip('0').rstrip('.')
+            return txt.replace('.', ',')
+        return numeric.apply(fmt_val)
+    except Exception as e:
+        logging.warning("Warning formatting distance: %s", e)
+        return s.astype(str)
+
+
+
 def append_new_rows(sh, tab_name, df, key_column):
     """
     Append new rows from df into sheet tab_name.
@@ -581,6 +619,22 @@ def main():
     client = garmin_login()
     sh = sheets_client()
 
+    # direct na sh = sheets_client()
+    try:
+        ws_sport = sh.worksheet("Sport")
+        header_vals = ws_sport.get_all_values()
+        if header_vals and header_vals[0] and header_vals[0][0].startswith("col_"):
+            # sheet heeft gegenereerde headers; zet correcte header uit df_activities (indien beschikbaar)
+            if 'df_activities' in locals() and not df_activities.empty:
+                new_header = _make_unique_headers(df_activities.columns.tolist())
+                ws_sport.update([new_header])
+                logging.info("Replaced generic Sport header with: %s", new_header)
+            else:
+                logging.warning("Sport sheet has generic header but df_activities not available to set header.")
+    except Exception as e:
+        logging.debug("Header-fix check skipped or failed: %s", e)
+
+    
     # Sport (incremental append)
     # Run a cleanup first to normalize headers and dedupe existing rows,
     # so append_new_rows can rely on a sane header row.
