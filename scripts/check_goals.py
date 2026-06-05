@@ -8,8 +8,10 @@ from google.oauth2.service_account import Credentials
 
 # Config via env (secrets)
 SHEET_ID = os.environ.get("SHEET_ID")
-GOAL_DISTANCE_KM = float(os.environ.get("GOAL_DISTANCE_KM") or 0)  # 0 = disabled
-GOAL_STEPS = int(os.environ.get("GOAL_STEPS") or 0)               # 0 = disabled
+# Optioneel: override default doelen via secrets (strings)
+# Als leeg of niet gezet: gebruik standaardcombinaties hieronder
+GOAL_DISTANCE_KM = os.environ.get("GOAL_DISTANCE_KM")  # optioneel, niet gebruikt bij standaardcombinaties
+GOAL_STEPS = os.environ.get("GOAL_STEPS")              # optioneel
 
 def sheets_client():
     creds = Credentials.from_service_account_info(
@@ -34,11 +36,35 @@ def parse_number(x):
     if x is None or x == "":
         return None
     try:
-        # replace comma decimal with dot
         s = str(x).replace(",", ".")
         return float(s)
     except:
         return None
+
+def parse_int(x):
+    if x is None or x == "":
+        return None
+    try:
+        s = str(x).replace(",", ".")
+        return int(float(s))
+    except:
+        return None
+
+def goal_combinations_met(km, steps):
+    """
+    Jouw gewenste combinaties:
+      - >=10000 stappen
+      - of >=25 km en >=5000 stappen
+      - of >=100 km en >=1000 stappen
+    Retourneert (bool, reason_string)
+    """
+    if steps is not None and steps >= 10000:
+        return True, "≥ 10.000 stappen"
+    if km is not None and steps is not None and km >= 25 and steps >= 5000:
+        return True, "≥ 25 km en ≥ 5.000 stappen"
+    if km is not None and steps is not None and km >= 100 and steps >= 1000:
+        return True, "≥ 100 km en ≥ 1.000 stappen"
+    return False, "Geen combinatie gehaald"
 
 def main():
     df = read_sport_sheet()
@@ -46,38 +72,31 @@ def main():
         print("Geen data in Sport sheet gevonden.")
         return
 
-    # normalize column names to lower for robust lookup
+    # normalize header lookup
     cols = {c.strip().lower(): c for c in df.columns}
-    date_col = None
-    if "starttimelocal" in cols:
-        date_col = cols["starttimelocal"]
-    elif "date" in cols:
-        date_col = cols["date"]
-    else:
-        # try first column
-        date_col = df.columns[0]
+    date_col = cols.get("starttimelocal") or cols.get("date") or df.columns[0]
 
-    # distance column candidates
+    # distance candidates
     dist_col = None
-    for cand in ("distance_km", "distance", "dist"):
+    for cand in ("distance_km","distance","dist","distance_km"):
         if cand in cols:
             dist_col = cols[cand]
             break
-    # steps column candidates
+    # steps candidates
     steps_col = None
-    for cand in ("steps", "totalsteps", "stepcount"):
+    for cand in ("steps","totalsteps","stepcount"):
         if cand in cols:
             steps_col = cols[cand]
             break
 
-    # parse dates and numeric columns
+    # parse
     df[date_col] = pd.to_datetime(df[date_col].astype(str).str[:10], errors="coerce")
     if dist_col:
         df["_dist"] = df[dist_col].apply(parse_number)
     else:
         df["_dist"] = None
     if steps_col:
-        df["_steps"] = df[steps_col].apply(lambda x: int(float(str(x).replace(",", "."))) if x not in (None,"") else None)
+        df["_steps"] = df[steps_col].apply(parse_int)
     else:
         df["_steps"] = None
 
@@ -86,44 +105,50 @@ def main():
 
     def summarize_for(day):
         sub = df[df[date_col].dt.date == day]
-        total_km = sub["_dist"].dropna().astype(float).sum() if "_dist" in sub else 0
+        total_km = sub["_dist"].dropna().astype(float).sum() if "_dist" in sub else 0.0
         total_steps = sub["_steps"].dropna().astype(int).sum() if "_steps" in sub else 0
         return total_km, total_steps
 
     y_km, y_steps = summarize_for(yesterday)
     t_km, t_steps = summarize_for(today)
 
+    # Evaluate combinations (or fallback to simple thresholds if provided)
+    # If user provided GOAL_DISTANCE_KM and GOAL_STEPS, we can also evaluate simple AND/OR rules.
+    # But by default we use the three predefined combinations.
+    y_met, y_reason = goal_combinations_met(y_km, y_steps)
+    t_met, t_reason = goal_combinations_met(t_km, t_steps)
+
     # Build email body
     lines = []
     lines.append(f"Garmin sync resultaat — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append("")
     lines.append(f"Gisteren ({yesterday.isoformat()}):")
-    if GOAL_DISTANCE_KM > 0:
-        lines.append(f"  Afstand: {y_km:.2f} km (doel: {GOAL_DISTANCE_KM} km) -> {'✅ gehaald' if y_km >= GOAL_DISTANCE_KM else '❌ niet gehaald'}")
-    if GOAL_STEPS > 0:
-        lines.append(f"  Stappen: {y_steps} (doel: {GOAL_STEPS}) -> {'✅ gehaald' if y_steps >= GOAL_STEPS else '❌ niet gehaald'}")
-    if GOAL_DISTANCE_KM == 0 and GOAL_STEPS == 0:
-        lines.append("  Geen doelen ingesteld (GOAL_DISTANCE_KM en GOAL_STEPS niet gezet).")
-
+    lines.append(f"  Afstand: {y_km:.2f} km")
+    lines.append(f"  Stappen: {y_steps}")
+    lines.append(f"  Doelstatus: {'✅ gehaald' if y_met else '❌ niet gehaald'} ({y_reason})")
     lines.append("")
     lines.append(f"Vandaag ({today.isoformat()}):")
-    if GOAL_DISTANCE_KM > 0:
-        lines.append(f"  Afstand: {t_km:.2f} km (doel: {GOAL_DISTANCE_KM} km) -> {'✅ gehaald' if t_km >= GOAL_DISTANCE_KM else '❌ niet gehaald'}")
-    if GOAL_STEPS > 0:
-        lines.append(f"  Stappen: {t_steps} (doel: {GOAL_STEPS}) -> {'✅ gehaald' if t_steps >= GOAL_STEPS else '❌ niet gehaald'}")
-
+    lines.append(f"  Afstand: {t_km:.2f} km")
+    lines.append(f"  Stappen: {t_steps}")
+    lines.append(f"  Doelstatus: {'✅ gehaald' if t_met else '❌ niet gehaald'} ({t_reason})")
+    lines.append("")
+    lines.append("Opmerking: de standaardcombinaties zijn:")
+    lines.append("  • ≥10.000 stappen")
+    lines.append("  • of ≥25 km en ≥5.000 stappen")
+    lines.append("  • of ≥100 km en ≥1.000 stappen")
     lines.append("")
     lines.append("Groet,")
     lines.append("Je Garmin Sync")
 
     body = "\n".join(lines)
 
-    # write to file for workflow to pick up
-    out_path = os.path.join(os.path.dirname(__file__), "goals_email.txt")
+    out_dir = os.path.dirname(__file__)
+    if not out_dir:
+        out_dir = "."
+    out_path = os.path.join(out_dir, "goals_email.txt")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(body)
 
-    # also print to stdout (visible in Actions log)
     print(body)
 
 if __name__ == "__main__":
