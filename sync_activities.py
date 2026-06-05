@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import os
 import json
-import time
 import hashlib
 import gspread
+import pandas as pd
 from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def get_garmin_client():
     client = Garmin(os.environ.get('GARMIN_EMAIL'), os.environ.get('GARMIN_PASSWORD'))
     client.login()
@@ -21,7 +24,6 @@ def seconds_to_hms(seconds):
 def format_run_pace(ms):
     if not ms or ms <= 0:
         return ""
-    # ms = meters per second
     seconds_per_km = 1000 / ms
     return f"{int(seconds_per_km // 60):02d}:{int(seconds_per_km % 60):02d}"
 
@@ -32,23 +34,23 @@ def format_swim_pace(ms):
     return f"{int(seconds_100m // 60):02d}:{int(seconds_100m % 60):02d}"
 
 def _row_checksum(rec):
-    """
-    Create a fallback id based on a checksum of a few stable fields.
-    """
     s = "|".join(str(rec.get(k, "")) for k in ("startTimeLocal", "distance", "duration", "activityType"))
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
+# -----------------------------
+# Core: fetch + clean activities
+# -----------------------------
 def get_clean_activities(client, lookback_days=7, start=0, limit=50):
     """
-    Fetch activities from Garmin and return a cleaned pandas-like list of dicts (rows).
-    - Normalizes startTimeLocal to datetime
-    - Ensures activityId exists (fallback to checksum)
-    - Converts distance to km numeric where possible
-    - Drops duplicate activityId entries (keeps first)
-    Returns: list of dicts (cleaned activities)
+    Fetch activities and return a cleaned pandas DataFrame:
+      - normalize startTimeLocal to datetime
+      - ensure activityId exists (fallback to checksum)
+      - distance in km (distance_km)
+      - duration in seconds (duration_s)
+      - activityType_key normalized
+      - drop duplicate activityId rows (keep first)
+      - filter by lookback_days
     """
-    import pandas as pd  # local import to keep module lightweight if not used elsewhere
-
     activities = client.get_activities(start, limit)
     if not activities:
         return pd.DataFrame()
@@ -69,7 +71,8 @@ def get_clean_activities(client, lookback_days=7, start=0, limit=50):
     if "distance" in df.columns:
         df["distance_km"] = pd.to_numeric(df["distance"], errors="coerce")
         # If values look like meters (>100), convert to km
-        df.loc[df["distance_km"] > 100, "distance_km"] = df.loc[df["distance_km"] > 100, "distance_km"] / 1000.0
+        mask = df["distance_km"].notna() & (df["distance_km"] > 100)
+        df.loc[mask, "distance_km"] = df.loc[mask, "distance_km"] / 1000.0
 
     # Duration numeric
     if "duration" in df.columns:
@@ -83,25 +86,26 @@ def get_clean_activities(client, lookback_days=7, start=0, limit=50):
             except Exception:
                 return str(x).lower()
         df["activityType_key"] = df["activityType"].apply(_type_key)
+    else:
+        df["activityType_key"] = ""
 
-    # Drop exact duplicate activityId rows
+    # Drop duplicate activityId rows
     df = df.drop_duplicates(subset=["activityId"], keep="first").reset_index(drop=True)
 
-    # Filter by lookback_days
+    # Filter by lookback_days if startTimeLocal present
     if "startTimeLocal" in df.columns:
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=lookback_days)
         df = df[df["startTimeLocal"] >= cutoff]
 
     return df
 
-def sync_activities_to_sheet():
+# -----------------------------
+# Sync to Google Sheet (append new)
+# -----------------------------
+def sync_activities_to_sheet(lookback_days=7, start=0, limit=50):
     """
-    Original-style sync function that appends new activities to the 'Sport' sheet.
-    Uses get_clean_activities to centralize normalization/dedupe logic.
+    Fetch cleaned activities and append only truly new activities to the 'Sport' sheet.
     """
-    import pandas as pd
-
-    lookback_days = 7
     print(f"🚀 Start Daily Sport Sync (last {lookback_days} days)...")
     client = get_garmin_client()
 
@@ -113,11 +117,29 @@ def sync_activities_to_sheet():
     sh = gc.open_by_key(os.environ.get('SHEET_ID'))
     sport_sheet = sh.worksheet("Sport")
 
-    # Load existing IDs from sheet (defensive)
-    all_rows = sport_sheet.get_all_values()
-    existing_ids = [row[10] for row in all_rows if len(row) > 10]
+    # Load existing IDs from sheet robustly: try to find a header column that looks like activityId
+    all_values = sport_sheet.get_all_values()
+    existing_ids = set()
+    if all_values:
+        header = all_values[0]
+        # find index of column that contains 'activity' or 'id'
+        idx = None
+        for i, h in enumerate(header):
+            if h and ("activity" in h.lower() or "id" in h.lower()):
+                idx = i
+                break
+        if idx is not None:
+            for row in all_values[1:]:
+                if len(row) > idx and row[idx] not in ("", None):
+                    existing_ids.add(str(row[idx]))
+        else:
+            # fallback: if sheet has at least 11 columns, assume column 11 (index 10) is activityId (legacy)
+            if len(header) > 10:
+                for row in all_values[1:]:
+                    if len(row) > 10 and row[10]:
+                        existing_ids.add(str(row[10]))
 
-    df = get_clean_activities(client, lookback_days=lookback_days, start=0, limit=50)
+    df = get_clean_activities(client, lookback_days=lookback_days, start=start, limit=limit)
     if df.empty:
         print("  💤 No activities fetched.")
         return
@@ -151,11 +173,10 @@ def sync_activities_to_sheet():
         speed_bike = round(avg_speed_ms * 3.6, 2) if any(x in str(type_key) for x in ["cycling", "biking"]) else ""
         pace_swim = format_swim_pace(avg_speed_ms) if "swimming" in str(type_key) else ""
 
-        distance_km = None
+        distance_km = ""
         if "distance_km" in act and not pd.isna(act["distance_km"]):
             distance_km = round(float(act["distance_km"]), 2)
         else:
-            # fallback to raw distance if present (and convert meters->km)
             raw = act.get("distance")
             try:
                 raw_n = float(raw)
@@ -194,6 +215,7 @@ def sync_activities_to_sheet():
         print(f"  ✅ {len(new_rows)} new activities added.")
     else:
         print("  💤 All up to date.")
+
 
 if __name__ == "__main__":
     sync_activities_to_sheet()
