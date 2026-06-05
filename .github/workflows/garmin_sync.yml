@@ -4,9 +4,7 @@ on:
   schedule:
     # Cover both CET and CEST: 08:00 and 20:00 Amsterdam time
     - cron: "0 6 * * *"   # 08:00 CEST (UTC+2) -> 06:00 UTC
-    - cron: "0 7 * * *"   # 08:00 CET  (UTC+1) -> 07:00 UTC
     - cron: "0 18 * * *"  # 20:00 CEST (UTC+2) -> 18:00 UTC
-    - cron: "0 19 * * *"  # 20:00 CET  (UTC+1) -> 19:00 UTC
   workflow_dispatch:
 
 concurrency:
