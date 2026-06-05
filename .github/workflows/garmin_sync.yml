@@ -71,6 +71,26 @@ jobs:
           cat scripts/goals_email.txt || true
           cat scripts/goals_email.log || true
 
+      - name: Debug email body and ensure file exists
+        if: always()
+        run: |
+          echo "PWD: $(pwd)"
+          echo "Listing repo root:"
+          ls -la
+          echo "Listing scripts dir:"
+          ls -la scripts || true
+          echo "=== Preview of scripts/goals_email.txt ==="
+          sed -n '1,200p' scripts/goals_email.txt || true
+          echo "=== File size (bytes) ==="
+          wc -c scripts/goals_email.txt || true
+          if [ ! -s scripts/goals_email.txt ]; then
+            echo "ERROR: scripts/goals_email.txt is empty or missing."
+            # optioneel: maak een placeholder zodat mailstap niet faalt
+            # echo "Geen inhoud beschikbaar" > scripts/goals_email.txt
+            # exit 1   # of exit 0 als je niet wilt dat workflow faalt
+          fi
+
+
       - name: Send results email via SMTP
         if: always()
         uses: dawidd6/action-send-mail@v3
