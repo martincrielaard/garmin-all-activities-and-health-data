@@ -15,16 +15,35 @@ def sheets_client():
     )
     return gspread.authorize(creds)
 
-def read_sport_sheet():
+def read_dashboard_sheet():
+    """
+    Lees het Dashboard-blad en retourneer een DataFrame met kolommen:
+    - date (kolom A)
+    - distance (kolom B)
+    - steps (kolom C)
+    Verwacht dat de eerste rij headers bevat; als niet, wordt de eerste rij als header gebruikt.
+    """
     gc = sheets_client()
     sh = gc.open_by_key(SHEET_ID)
-    ws = sh.worksheet("Sport")
+    try:
+        ws = sh.worksheet("Dashboard")
+    except Exception as e:
+        raise RuntimeError(f"Kan worksheet 'Dashboard' niet openen: {e}")
+
     vals = ws.get_all_values()
     if not vals or len(vals) < 2:
         return pd.DataFrame()
+
     header = vals[0]
     rows = vals[1:]
-    df = pd.DataFrame(rows, columns=header)
+
+    # Zorg dat elke rij minstens 3 kolommen heeft
+    normalized = []
+    for r in rows:
+        row = list(r) + [""] * max(0, 3 - len(r))
+        normalized.append(row[:3])
+
+    df = pd.DataFrame(normalized, columns=["date", "distance", "steps"])
     return df
 
 def parse_number(x):
@@ -46,6 +65,13 @@ def parse_int(x):
         return None
 
 def goal_combinations_met(km, steps):
+    """
+    Jouw combinaties:
+      - >= 10.000 stappen
+      - of >= 25 km en >= 5.000 stappen
+      - of >= 100 km en >= 1.000 stappen
+    Retourneert (bool, reason_string)
+    """
     if steps is not None and steps >= 10000:
         return True, "≥ 10.000 stappen"
     if km is not None and steps is not None and km >= 25 and steps >= 5000:
@@ -55,44 +81,34 @@ def goal_combinations_met(km, steps):
     return False, "Geen combinatie gehaald"
 
 def main():
-    df = read_sport_sheet()
-    if df.empty:
-        body = "Geen data in Sport sheet gevonden.\n"
+    try:
+        df = read_dashboard_sheet()
+    except Exception as e:
+        body = f"Fout bij lezen van Dashboard sheet: {e}\n"
         print(body)
+        os.makedirs("scripts", exist_ok=True)
         with open("scripts/goals_email.txt", "w", encoding="utf-8") as f:
             f.write(body)
         return
 
-    cols = {c.strip().lower(): c for c in df.columns}
-    date_col = cols.get("starttimelocal") or cols.get("date") or df.columns[0]
+    if df.empty:
+        body = "Geen data in Dashboard sheet gevonden.\n"
+        print(body)
+        os.makedirs("scripts", exist_ok=True)
+        with open("scripts/goals_email.txt", "w", encoding="utf-8") as f:
+            f.write(body)
+        return
 
-    dist_col = None
-    for cand in ("distance_km","distance","dist"):
-        if cand in cols:
-            dist_col = cols[cand]
-            break
-
-    steps_col = None
-    for cand in ("steps","totalsteps","stepcount"):
-        if cand in cols:
-            steps_col = cols[cand]
-            break
-
-    df[date_col] = pd.to_datetime(df[date_col].astype(str).str[:10], errors="coerce")
-    if dist_col:
-        df["_dist"] = df[dist_col].apply(parse_number)
-    else:
-        df["_dist"] = None
-    if steps_col:
-        df["_steps"] = df[steps_col].apply(parse_int)
-    else:
-        df["_steps"] = None
+    # Parse datum (eerste 10 tekens) en numerieke kolommen
+    df["date_parsed"] = pd.to_datetime(df["date"].astype(str).str[:10], errors="coerce")
+    df["_dist"] = df["distance"].apply(parse_number)
+    df["_steps"] = df["steps"].apply(parse_int)
 
     today = datetime.now().date()
     yesterday = today - timedelta(days=1)
 
     def summarize_for(day):
-        sub = df[df[date_col].dt.date == day]
+        sub = df[df["date_parsed"].dt.date == day]
         total_km = sub["_dist"].dropna().astype(float).sum() if "_dist" in sub else 0.0
         total_steps = sub["_steps"].dropna().astype(int).sum() if "_steps" in sub else 0
         return total_km, total_steps
@@ -105,6 +121,8 @@ def main():
 
     lines = []
     lines.append(f"Garmin sync resultaat — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("")
+    lines.append("Bron: tabblad 'Dashboard' (kolom A = datum, B = afstand, C = stappen)")
     lines.append("")
     lines.append(f"Gisteren ({yesterday.isoformat()}):")
     lines.append(f"  Afstand: {y_km:.2f} km")
@@ -125,8 +143,12 @@ def main():
     lines.append("Je Garmin Sync")
 
     body = "\n".join(lines)
-    with open("scripts/goals_email.txt", "w", encoding="utf-8") as f:
+
+    os.makedirs("scripts", exist_ok=True)
+    out_path = os.path.join("scripts", "goals_email.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(body)
+
     print(body)
 
 if __name__ == "__main__":
