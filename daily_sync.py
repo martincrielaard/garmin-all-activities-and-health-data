@@ -9,7 +9,7 @@ import re
 from google.oauth2.service_account import Credentials
 
 # Use centralized cleaning
-from sync_activities import get_clean_activities
+from sync_activities import get_clean_activities, seconds_to_hms, format_run_pace, format_swim_pace
 
 MAX_RETRIES = 5
 RETRY_DELAY = 10
@@ -114,7 +114,7 @@ def format_distance_series(s):
         return s.astype(str)
 
 # -----------------------------
-# Append new rows (robust)
+# Append new rows (idempotent: update existing rows, append new)
 # -----------------------------
 def append_new_rows(sh, tab_name, df, key_column):
     if df is None or df.empty:
@@ -152,41 +152,70 @@ def append_new_rows(sh, tab_name, df, key_column):
         logging.info("Created sheet %s with headers: %s", tab_name, header)
         return
 
-    # read existing rows robustly and determine existing keys by best-match header
-    existing = safe_get_all_records_manual(ws)
-    existing_keys = set()
-    if existing:
-        existing_df = pd.DataFrame(existing)
-        # try to find a column that looks like activityId
-        candidates = [c for c in existing_df.columns if re.search(r'activity|id', c, re.IGNORECASE)]
-        if candidates:
-            guessed = candidates[0]
-            existing_keys = set(existing_df[guessed].astype(str))
-            logging.debug("Using existing key column '%s' for dedupe", guessed)
-        elif key_column in existing_df.columns:
-            existing_keys = set(existing_df[key_column].astype(str))
+    # Build existing_map: key -> sheet_row_number
+    all_values = ws.get_all_values()
+    existing_map = {}
+    if all_values:
+        header = all_values[0]
+        # find best candidate column index for key_column
+        key_idx = None
+        for i, h in enumerate(header):
+            if h and (h.strip().lower() == key_column.lower() or key_column.lower() in h.strip().lower() or "activity" in h.strip().lower() or "id" in h.strip().lower()):
+                key_idx = i
+                break
+        if key_idx is None and len(header) > 10:
+            key_idx = 10
+        if key_idx is not None:
+            for rownum, row in enumerate(all_values[1:], start=2):
+                if len(row) > key_idx and row[key_idx] not in ("", None):
+                    existing_map[str(row[key_idx])] = rownum
+
+    # Prepare updates and appends
+    updates = []      # (rownum, values)
+    to_append = []    # values
+    # Try to align values with sheet header if possible
+    sheet_header = all_values[0] if all_values else None
+    for _, r in df.iterrows():
+        # If sheet header exists, build values in that order; otherwise use df.columns order
+        if sheet_header:
+            values = []
+            for col in sheet_header:
+                # if col matches a df column (case-insensitive), use that value
+                match = None
+                for c in df.columns:
+                    if c and c.strip().lower() == str(col).strip().lower():
+                        match = c
+                        break
+                if match:
+                    values.append(r.get(match, ""))
+                else:
+                    values.append("")
         else:
-            # fallback: if sheet has at least 11 columns, use index 10
-            if existing_df.shape[1] > 10:
-                existing_keys = set(existing_df.iloc[:, 10].astype(str))
-            else:
-                existing_keys = set()
+            values = [r.get(c, "") for c in df.columns]
+
+        key = str(r[key_column])
+        if key in existing_map:
+            updates.append((existing_map[key], values))
+        else:
+            to_append.append(values)
+
+    # Execute updates
+    for rownum, values in updates:
+        try:
+            ws.update(f"A{rownum}", [values])
+        except Exception as e:
+            logging.warning("Failed to update row %d: %s", rownum, e)
+
+    # Batch append remaining rows
+    if to_append:
+        to_append.reverse()
+        ws.append_rows(to_append, value_input_option='USER_ENTERED')
+        logging.info("Added %d new rows to %s", len(to_append), tab_name)
     else:
-        existing_keys = set()
-
-    new_rows_df = df[~df[key_column].isin(existing_keys)]
-    if new_rows_df.empty:
         logging.info("No new rows for %s", tab_name)
-        return
-
-    if 'distance' in new_rows_df.columns:
-        new_rows_df['distance'] = format_distance_series(new_rows_df['distance'])
-
-    ws.append_rows(new_rows_df.astype(str).values.tolist())
-    logging.info("Added %d new rows to %s", len(new_rows_df), tab_name)
 
 # -----------------------------
-# Health fetch helpers (copied/complete)
+# Health helpers (copied from previous implementation)
 # -----------------------------
 @retry
 def fetch_health_for_date(client, date_str):
