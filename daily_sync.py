@@ -133,9 +133,16 @@ def fetch_activities(client):
     # ensure activityId exists and is string
     if "activityId" in df.columns:
         df["activityId"] = df["activityId"].astype(str)
+        # verwijder dubbele activityId's (houd de eerste)
+        before = len(df)
+        df = df.drop_duplicates(subset=["activityId"], keep="first").reset_index(drop=True)
+        after = len(df)
+        if before != after:
+            logging.info("Dropped %d duplicate activities from fetched data", before - after)
     else:
         logging.warning("Fetched activities do not contain 'activityId' column")
     return df
+
 
 
 # -----------------------------
@@ -215,6 +222,16 @@ def append_new_rows(sh, tab_name, df, key_column):
         logging.error("Incoming dataframe missing key column '%s' — aborting append", key_column)
         return
 
+    # ensure incoming key column is string
+    df[key_column] = df[key_column].astype(str)
+
+    # verwijder dubbele keys in de incoming dataframe zelf (veiligheidsmaatregel)
+    before_in = len(df)
+    df = df.drop_duplicates(subset=[key_column], keep="first").reset_index(drop=True)
+    after_in = len(df)
+    if before_in != after_in:
+        logging.info("Dropped %d duplicate rows in incoming dataframe for key %s", before_in - after_in, key_column)
+
     try:
         ws = sh.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
@@ -225,14 +242,24 @@ def append_new_rows(sh, tab_name, df, key_column):
         if key_column not in header:
             # ensure key_column present as first column
             header.insert(0, key_column)
+
+        # Ensure incoming df has the key_column (create empty column if missing)
+        if key_column not in df.columns:
+            df[key_column] = ""
+
+        # Reorder df columns to match header (drop any extra cols not in header)
+        ordered_cols = [c for c in header if c in df.columns]
+        df_to_append = df[ordered_cols].astype(str)
+
         ws.update([header])
         # format distance if present before initial append
-        if 'distance' in df.columns:
-            df['distance'] = format_distance_series(df['distance'])
-        # append rows (stringified)
-        ws.append_rows(df.astype(str).values.tolist())
+        if 'distance' in df_to_append.columns:
+            df_to_append['distance'] = format_distance_series(df_to_append['distance'])
+        # append rows (stringified) in the same column order as header
+        ws.append_rows(df_to_append.values.tolist())
         logging.info("Created sheet %s with headers: %s", tab_name, header)
         return
+    
 
     # read existing rows robustly
     existing = safe_get_all_records_manual(ws)
@@ -256,9 +283,6 @@ def append_new_rows(sh, tab_name, df, key_column):
     else:
         existing_keys = set()
 
-    # ensure incoming key column is string
-    df[key_column] = df[key_column].astype(str)
-
     # determine new rows (those whose key is not in existing_keys)
     new_rows = df[~df[key_column].isin(existing_keys)]
 
@@ -274,40 +298,6 @@ def append_new_rows(sh, tab_name, df, key_column):
     ws.append_rows(new_rows.astype(str).values.tolist())
     logging.info("Added %d new rows to %s", len(new_rows), tab_name)
 
-
-# helper used by append_new_rows
-def format_distance_series(s):
-    """
-    Format a pandas Series of distances for human-friendly display.
-    Heuristics:
-      - try numeric conversion
-      - if numeric max > 100 assume meters and convert to km
-      - return strings with comma as decimal separator (existing behaviour)
-    Note: this returns strings for sheet display. If you need numeric km values,
-    create a separate numeric column (distance_km) before calling this.
-    """
-    try:
-        numeric = pd.to_numeric(s, errors='coerce')
-        # heuristiek meters->km
-        if numeric.notna().any() and numeric.max() > 100:
-            numeric = numeric / 1000.0
-        # format: behoud zoveel decimalen als aanwezig (strip trailing zeros optioneel)
-        def fmt_val(x):
-            if pd.isna(x):
-                return ""
-            # convert to string with full precision, then normalize decimal separator
-            txt = repr(float(x))
-            # remove scientific notation if any
-            if 'e' in txt or 'E' in txt:
-                txt = f"{float(x):f}"
-            # strip trailing zeros and optional trailing dot
-            if '.' in txt:
-                txt = txt.rstrip('0').rstrip('.')
-            return txt.replace('.', ',')
-        return numeric.apply(fmt_val)
-    except Exception as e:
-        logging.warning("Warning formatting distance: %s", e)
-        return s.astype(str)
 
 
 # -----------------------------
