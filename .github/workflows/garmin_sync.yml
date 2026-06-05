@@ -2,9 +2,8 @@ name: Garmin Connect Daily Sync
 
 on:
   schedule:
-    # Cover both CET and CEST: 08:00 and 20:00 Amsterdam time
-    - cron: "0 6 * * *"   # 08:00 CEST (UTC+2) -> 06:00 UTC
-    - cron: "0 18 * * *"  # 20:00 CEST (UTC+2) -> 18:00 UTC
+    - cron: "0 6 * * *"   # ~08:00 Amsterdam (CEST)
+    - cron: "0 18 * * *"  # ~20:00 Amsterdam (CEST)
   workflow_dispatch:
 
 concurrency:
@@ -41,15 +40,6 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: |
-          # --- Ensure we only run at 08:00 or 20:00 Europe/Amsterdam local time ---
-          local_hour=$(TZ='Europe/Amsterdam' date +%H)
-          echo "Local hour in Europe/Amsterdam: $local_hour"
-          if [ "$local_hour" != "08" ] && [ "$local_hour" != "20" ]; then
-            echo "Not scheduled Amsterdam hour (08 or 20). Skipping run."
-            exit 0
-          fi
-
-          # Try daily_sync.py if present, otherwise run the two separate scripts.
           if [ -f daily_sync.py ]; then
             python daily_sync.py 2>&1 | tee sync.log
             exit_code=${PIPESTATUS[0]}
@@ -58,9 +48,7 @@ jobs:
             act_code=${PIPESTATUS[0]}
             python sync_health.py 2>&1 | tee sync_health.log
             hlth_code=${PIPESTATUS[0]}
-            # combine logs for convenience
             cat sync_activities.log sync_health.log > sync.log || true
-            # prefer nonzero exit if any failed
             if [ "${act_code}" != "0" ] || [ "${hlth_code}" != "0" ]; then
               exit_code=1
             else
@@ -69,9 +57,32 @@ jobs:
           fi
           exit ${exit_code}
 
-      - name: Upload sync log
+      - name: Run goals check and produce email body
         if: always()
-        uses: actions/upload-artifact@v4
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          # configureerbare doelen (optioneel, default in script ook aanwezig)
+          GOAL_DISTANCE_KM: ${{ secrets.GOAL_DISTANCE_KM }}   # bv "10" (km)
+          GOAL_STEPS: ${{ secrets.GOAL_STEPS }}               # bv "10000"
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}                   # ontvanger
+        run: |
+          python scripts/check_goals.py > goals_email.txt 2>&1 || true
+          echo "=== goals_email.txt ==="
+          cat goals_email.txt
+
+      - name: Send results email (SMTP)
+        if: always()
+        uses: dawidd6/action-send-mail@v3
         with:
-          name: sync-log
-          path: sync.log
+          # SMTP server settings (zet als repo secrets)
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Garmin sync: doelenstatus voor gisteren en vandaag"
+          body: ${{ steps.run_goals_check_and_produce_email.outputs.body || '' }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.SMTP_FROM }}
+          # fallback: gebruik het gegenereerde bestand als body
+          body_file: scripts/goals_email.txt
