@@ -71,7 +71,7 @@ jobs:
           cat scripts/goals_email.txt || true
           cat scripts/goals_email.log || true
 
-            - name: Debug email body (workspace check)
+      - name: Debug email body (workspace check)
         run: |
           workspace=${GITHUB_WORKSPACE:-$(pwd)}
           echo "Workspace: $workspace"
@@ -93,12 +93,8 @@ jobs:
             echo "EOF" >> $GITHUB_OUTPUT
             exit 0
           fi
-
-          # genereer een unieke delimiter (timestamp+random)
           DELIM="DELIM_$(date +%s)_$RANDOM"
           echo "Using delimiter: $DELIM" >&2
-
-          # schrijf multiline output met die delimiter
           echo "body<<${DELIM}" >> $GITHUB_OUTPUT
           cat "$file" >> $GITHUB_OUTPUT
           echo "${DELIM}" >> $GITHUB_OUTPUT
