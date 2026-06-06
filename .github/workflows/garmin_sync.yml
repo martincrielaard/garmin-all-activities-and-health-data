@@ -71,17 +71,18 @@ jobs:
           cat scripts/goals_email.txt || true
           cat scripts/goals_email.log || true
 
-      - name: Debug email body (workspace check)
+            - name: Debug email body (workspace check)
         run: |
           workspace=${GITHUB_WORKSPACE:-$(pwd)}
           echo "Workspace: $workspace"
+          echo "Listing scripts dir:"
           ls -la "$workspace/scripts" || true
           echo "File size:"
           wc -c "$workspace/scripts/goals_email.txt" || true
           echo "Preview:"
           sed -n '1,200p' "$workspace/scripts/goals_email.txt" || true
 
-            - name: Read email body into output (robust delimiter)
+      - name: Read email body into output (robust delimiter)
         id: read_body
         run: |
           workspace=${GITHUB_WORKSPACE:-$(pwd)}
@@ -102,7 +103,6 @@ jobs:
           cat "$file" >> $GITHUB_OUTPUT
           echo "${DELIM}" >> $GITHUB_OUTPUT
 
-
       - name: Send results email via SMTP
         uses: dawidd6/action-send-mail@v3
         with:
@@ -116,8 +116,7 @@ jobs:
           content_type: "text/plain"
           body: ${{ steps.read_body.outputs.body }}
 
-
-      - name: Upload sync log
+      - name: Upload sync log and email body
         if: always()
         uses: actions/upload-artifact@v4
         with:
