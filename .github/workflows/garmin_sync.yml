@@ -81,7 +81,7 @@ jobs:
           echo "Preview:"
           sed -n '1,200p' "$workspace/scripts/goals_email.txt" || true
 
-      - name: Read email body into output
+            - name: Read email body into output (robust delimiter)
         id: read_body
         run: |
           workspace=${GITHUB_WORKSPACE:-$(pwd)}
@@ -92,10 +92,16 @@ jobs:
             echo "EOF" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # safe multiline output via GITHUB_OUTPUT heredoc
-          echo "body<<EOF" >> $GITHUB_OUTPUT
+
+          # genereer een unieke delimiter (timestamp+random)
+          DELIM="DELIM_$(date +%s)_$RANDOM"
+          echo "Using delimiter: $DELIM" >&2
+
+          # schrijf multiline output met die delimiter
+          echo "body<<${DELIM}" >> $GITHUB_OUTPUT
           cat "$file" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "${DELIM}" >> $GITHUB_OUTPUT
+
 
       - name: Send results email via SMTP
         uses: dawidd6/action-send-mail@v3
