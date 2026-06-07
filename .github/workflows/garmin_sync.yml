@@ -81,8 +81,8 @@ jobs:
           wc -c "$workspace/scripts/goals_email.txt" || true
           echo "Preview:"
           sed -n '1,200p' "$workspace/scripts/goals_email.txt" || true
-
-        - name: Read email body into output (robust delimiter, newline-safe)
+          
+      - name: Read email body into output (robust delimiter, newline-safe)
         id: read_body
         run: |
           workspace=${GITHUB_WORKSPACE:-$(pwd)}
