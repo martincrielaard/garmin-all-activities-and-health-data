@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
+from zoneinfo import ZoneInfo
 
 SHEET_ID = os.environ.get("SHEET_ID")
 
@@ -93,8 +94,14 @@ def main():
     df["_dist"] = df["distance"].apply(parse_number)
     df["_steps"] = df["steps"].apply(parse_int)
 
-    today = datetime.now().date()
+    # gebruik Amsterdam tijdzone
+    tz = ZoneInfo("Europe/Amsterdam")
+    now_local = datetime.now(tz)
+    today = now_local.date()
     yesterday = today - timedelta(days=1)
+
+    # en bij het maken van de header/timestamp:
+    lines.append(f"Garmin sync resultaat — {now_local.strftime('%Y-%m-%d %H:%M')}")
 
     def summarize_for(day):
         sub = df[df["date_parsed"].dt.date == day]
